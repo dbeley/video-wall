@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-import argparse, math, os, random, shutil, signal, subprocess, sys, time, glob
+import argparse, json, math, os, random, shutil, signal, subprocess, sys, time, glob
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
+
+
+@dataclass(frozen=True)
+class VideoMeta:
+    duration: float | None
+    has_audio: bool
+
+
+_metadata_cache: dict[Path, VideoMeta] = {}
 
 
 # -------- Utils --------
@@ -16,30 +26,23 @@ def run_cmd(argv: list[str]) -> str:
         return subprocess.check_output(argv, stderr=subprocess.STDOUT).decode(
             "utf-8", "ignore"
         )
-    except Exception:
+    except subprocess.CalledProcessError as exc:
+        output = exc.output.decode("utf-8", "ignore") if exc.output else ""
+        print(
+            f"[warn] command {' '.join(argv)} failed with code {exc.returncode}: {output}",
+            file=sys.stderr,
+        )
+        return ""
+    except Exception as exc:  # pragma: no cover - defensive logging
+        print(f"[warn] command {' '.join(argv)} failed: {exc}", file=sys.stderr)
         return ""
 
 
-def ffprobe_duration(path: Path) -> float | None:
-    out = run_cmd(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=nw=1:nk=1",
-            str(path),
-        ]
-    )
-    try:
-        return float(out.strip()) if out.strip() else None
-    except Exception:
-        return None
+def get_metadata(path: Path) -> VideoMeta:
+    meta = _metadata_cache.get(path)
+    if meta is not None:
+        return meta
 
-
-def ffprobe_has_audio(path: Path) -> bool:
     out = run_cmd(
         [
             "ffprobe",
@@ -48,21 +51,62 @@ def ffprobe_has_audio(path: Path) -> bool:
             "-select_streams",
             "a",
             "-show_entries",
-            "stream=index",
+            "format=duration,stream=index",
             "-of",
-            "csv=p=0",
+            "json",
             str(path),
         ]
     )
-    return bool(out.strip())
+
+    duration: float | None = None
+    has_audio = False
+    if out:
+        try:
+            data = json.loads(out)
+            fmt = data.get("format") or {}
+            dur_str = fmt.get("duration")
+            if dur_str:
+                duration = float(dur_str)
+            streams = data.get("streams") or []
+            has_audio = len(streams) > 0
+        except Exception as exc:  # pragma: no cover - fallback for malformed output
+            print(
+                f"[warn] failed to parse ffprobe output for {path}: {exc}",
+                file=sys.stderr,
+            )
+
+    meta = VideoMeta(duration=duration, has_audio=has_audio)
+    _metadata_cache[path] = meta
+    return meta
 
 
-def random_seek_50_75(path: Path) -> float:
-    dur = ffprobe_duration(path) or 0.0
+def normalize_seek(path: Path, offset: float, loop: bool) -> float:
+    meta = get_metadata(path)
+    dur = meta.duration or 0.0
+    if dur > 0:
+        if loop:
+            offset = offset % dur
+        max_seek = max(0.0, dur - 3.0)
+        offset = min(offset, max_seek)
+    return max(0.0, offset)
+
+
+def random_seek_50_75(path: Path, loop: bool) -> float:
+    dur = get_metadata(path).duration or 0.0
     if dur <= 0:
         return 0.0
     start = random.uniform(0.50, 0.75) * dur
-    return min(start, max(0.0, dur - 3.0))
+    return normalize_seek(path, start, loop)
+
+
+@dataclass
+class TileState:
+    path: Path
+    seek: float
+
+    @property
+    def metadata(self) -> VideoMeta:
+        return get_metadata(self.path)
 
 
 def pick(pool: list[Path], n: int) -> list[Path]:
@@ -151,7 +195,7 @@ def choose_hwaccel(pref: str | None = None) -> tuple[str | None, dict]:
 
 # -------- Command builder --------
 def build_ffmpeg_cmd(
-    files: list[Path],
+    tiles: list[TileState],
     rows: int,
     cols: int,
     cw: int,
@@ -165,7 +209,7 @@ def build_ffmpeg_cmd(
     verbose: bool,
     no_audio: bool,
 ) -> list[str]:
-    n = len(files)
+    n = len(tiles)
     args = ["ffmpeg", "-hide_banner", "-loglevel", "info" if verbose else "error"]
 
     # Global HW opts (e.g., -vaapi_device /dev/dri/renderD128)
@@ -173,7 +217,8 @@ def build_ffmpeg_cmd(
         args += [k, v]
 
     # Per-input: hwaccel + seek + input
-    for f in files:
+    for tile in tiles:
+        path = tile.path
         if loop:
             args += ["-stream_loop", "-1"]
         if hwaccel_mode == "cuda":
@@ -181,24 +226,34 @@ def build_ffmpeg_cmd(
         elif hwaccel_mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
         # else: software decode
-        args += ["-ss", f"{random_seek_50_75(f):.3f}", "-i", str(f.resolve())]
+        args += ["-ss", f"{tile.seek:.3f}", "-i", str(path.resolve())]
 
     # Build filter graph
     flt, vouts, with_audio = [], [], []
-    for i, f in enumerate(files):
-        pre = ""
-        # If we decoded to hardware frames, download to system memory for CPU filters
-        if hwaccel_mode in {"cuda", "vaapi"}:
-            # nv12 is a safe intermediate for both
-            pre = "hwdownload,format=nv12,"
+    for i, tile in enumerate(tiles):
+        ops: list[str] = []
+        if hwaccel_mode == "cuda":
+            ops.append(
+                f"scale_cuda={cw}:{ch}:force_original_aspect_ratio=decrease"
+            )
+            ops.append("hwdownload")
+            ops.append("format=nv12")
+        elif hwaccel_mode == "vaapi":
+            ops.append(
+                f"scale_vaapi=w={cw}:h={ch}:force_original_aspect_ratio=decrease"
+            )
+            ops.append("hwdownload")
+            ops.append("format=nv12")
+        else:
+            ops.append(f"scale={cw}:{ch}:force_original_aspect_ratio=decrease")
 
+        ops.append(f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:black")
+        ops.append("format=yuv420p")
         vouts.append(f"[v{i}]")
-        flt.append(
-            f"[{i}:v]{pre}"
-            f"scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
-            f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p[v{i}]"
-        )
-        if not no_audio and ffprobe_has_audio(f):
+        flt.append(f"[{i}:v]{','.join(ops)}[v{i}]")
+
+        meta = tile.metadata
+        if not no_audio and meta.has_audio:
             with_audio.append(i)
             flt.append(
                 f"[{i}:a]volume={vol},aresample=async=1:min_hard_comp=0.100[a{i}]"
@@ -208,13 +263,12 @@ def build_ffmpeg_cmd(
     flt.append(f"{''.join(vouts)}xstack=inputs={n}:layout={layout}[V]")
 
     maps = ["-map", "[V]"]
-    if not no_audio and with_audio:
+    want_audio = not no_audio and bool(with_audio)
+    if want_audio:
         flt.append(
             f"{''.join(f'[a{i}]' for i in with_audio)}amix=inputs={len(with_audio)}:dropout_transition=200[A]"
         )
         maps += ["-map", "[A]"]
-    else:
-        maps += ["-an"]
 
     total_w, total_h = cols * cw, rows * ch
 
@@ -227,7 +281,7 @@ def build_ffmpeg_cmd(
     # FAST path: rawvideo + PCM in a lightweight container (nut) over the pipe
     if fast:
         args += ["-c:v", "rawvideo", "-pix_fmt", "yuv420p"]
-        if "-an" not in maps:
+        if want_audio:
             args += ["-c:a", "pcm_s16le", "-ar", "48000"]
         else:
             args += ["-an"]
@@ -244,7 +298,7 @@ def build_ffmpeg_cmd(
             "-pix_fmt",
             "yuv420p",
         ]
-        if "-an" not in maps:
+        if want_audio:
             args += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
         else:
             args += ["-an"]
@@ -337,10 +391,14 @@ def main():
         random.seed(args.seed)
 
     exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
-    pool = [p for p in args.folder.iterdir() if p.suffix.lower() in exts]
+    pool = [p for p in args.folder.iterdir() if p.is_file() and p.suffix.lower() in exts]
     if len(pool) < args.count:
         raise SystemExit(f"Need at least {args.count} videos with extensions {exts}")
-    files = pick(pool, args.count)
+    initial_paths = pick(pool, args.count)
+    tiles = [
+        TileState(path=path, seek=random_seek_50_75(path, args.loop))
+        for path in initial_paths
+    ]
     rows, cols = grid(args.count, args.rows, args.cols)
 
     # Choose HW accel
@@ -352,9 +410,14 @@ def main():
         else:
             print()
 
+    paused = False
+    pending_seek: float | None = None
+    pipeline_start = time.monotonic()
+    ffmpeg = ffplay = None
+
     def build_cmd():
         return build_ffmpeg_cmd(
-            files=files,
+            tiles=tiles,
             rows=rows,
             cols=cols,
             cw=args.cell_width,
@@ -369,14 +432,73 @@ def main():
             no_audio=args.no_audio,
         )
 
-    ffmpeg, ffplay = launch_pipeline(build_cmd(), "Video Wall (fast+HW)", args.verbose)
-    paused = False
+    def update_tile_offsets(finalizing: bool = False):
+        nonlocal pipeline_start
+        if paused:
+            return
+        now = time.monotonic()
+        elapsed = now - pipeline_start
+        if elapsed <= 0:
+            return
+        for tile in tiles:
+            raw_seek = tile.seek + elapsed
+            if finalizing and not args.loop:
+                meta = tile.metadata
+                dur = meta.duration or 0.0
+                if dur > 0 and raw_seek >= dur - 0.5:
+                    tile.seek = random_seek_50_75(tile.path, args.loop)
+                    continue
+            tile.seek = normalize_seek(tile.path, raw_seek, args.loop)
+        pipeline_start = now
+
+    def restart_pipeline():
+        nonlocal ffmpeg, ffplay, pipeline_start
+        kill_proc(ffplay)
+        kill_proc(ffmpeg)
+        ffmpeg, ffplay = launch_pipeline(
+            build_cmd(), "Video Wall (fast+HW)", args.verbose
+        )
+        pipeline_start = time.monotonic()
+        if paused:
+            for proc in (ffmpeg, ffplay):
+                if proc is None:
+                    continue
+                try:
+                    os.kill(proc.pid, signal.SIGSTOP)
+                except Exception:
+                    pass
+
+    def replace_tile(index: int):
+        if not (0 <= index < len(tiles)):
+            return
+        update_tile_offsets()
+        active_paths = {t.path for j, t in enumerate(tiles) if j != index}
+        candidates = [p for p in pool if p not in active_paths]
+        new_path = (
+            random.choice(candidates) if candidates else random.choice(pool)
+        )
+        tiles[index] = TileState(
+            path=new_path, seek=random_seek_50_75(new_path, args.loop)
+        )
+        restart_pipeline()
+
+    def seek_tile(index: int, delta: float):
+        if not (0 <= index < len(tiles)):
+            return
+        update_tile_offsets()
+        tile = tiles[index]
+        tile.seek = normalize_seek(tile.path, tile.seek + delta, args.loop)
+        restart_pipeline()
+
+    restart_pipeline()
 
     print(
         "\nControls (focus terminal):\n"
         "  SPACE  = pause/resume\n"
         "  r      = replace a random tile\n"
         "  1..8   = replace a specific tile (1-indexed)\n"
+        "  f/F + #= seek forward 10s/30s for tile #\n"
+        "  b/B + #= seek backward 10s/30s for tile #\n"
         "  q      = quit\n"
     )
 
@@ -390,25 +512,27 @@ def main():
 
         while True:
             if ffplay.poll() is not None or ffmpeg.poll() is not None:
-                kill_proc(ffplay)
-                kill_proc(ffmpeg)
-                ffmpeg, ffplay = launch_pipeline(
-                    build_cmd(), "Video Wall (fast+HW)", args.verbose
-                )
-                if paused:
-                    for p in (ffmpeg, ffplay):
-                        try:
-                            os.kill(p.pid, signal.SIGSTOP)
-                        except Exception:
-                            pass
+                update_tile_offsets(finalizing=True)
+                restart_pipeline()
 
             dr, _, _ = select.select([sys.stdin], [], [], 0.1)
             if dr:
                 ch = sys.stdin.read(1)
+                if pending_seek is not None:
+                    if ch.isdigit():
+                        idx = int(ch) - 1
+                        if 0 <= idx < len(tiles):
+                            seek_tile(idx, pending_seek)
+                        pending_seek = None
+                        continue
+                    else:
+                        pending_seek = None
+
                 if ch == "q":
                     break
                 elif ch == " ":
                     if not paused:
+                        update_tile_offsets()
                         for p in (ffmpeg, ffplay):
                             try:
                                 os.kill(p.pid, signal.SIGSTOP)
@@ -422,43 +546,18 @@ def main():
                             except Exception:
                                 pass
                         paused = False
+                        pipeline_start = time.monotonic()
                 elif ch == "r":
-                    i = random.randrange(len(files))
-                    candidates = [p for p in pool if p not in files]
-                    files[i] = (
-                        random.choice(candidates) if candidates else random.choice(pool)
-                    )
-                    kill_proc(ffplay)
-                    kill_proc(ffmpeg)
-                    ffmpeg, ffplay = launch_pipeline(
-                        build_cmd(), "Video Wall (fast+HW)", args.verbose
-                    )
-                    if paused:
-                        for p in (ffmpeg, ffplay):
-                            try:
-                                os.kill(p.pid, signal.SIGSTOP)
-                            except Exception:
-                                pass
+                    replace_tile(random.randrange(len(tiles)))
+                elif ch in {"f", "F", "b", "B"}:
+                    step = 10.0 if ch in {"f", "b"} else 30.0
+                    if ch in {"b", "B"}:
+                        step = -step
+                    pending_seek = step
                 elif ch.isdigit():
                     i = int(ch) - 1
-                    if 0 <= i < len(files):
-                        candidates = [p for p in pool if p not in files]
-                        files[i] = (
-                            random.choice(candidates)
-                            if candidates
-                            else random.choice(pool)
-                        )
-                        kill_proc(ffplay)
-                        kill_proc(ffmpeg)
-                        ffmpeg, ffplay = launch_pipeline(
-                            build_cmd(), "Video Wall (fast+HW)", args.verbose
-                        )
-                        if paused:
-                            for p in (ffmpeg, ffplay):
-                                try:
-                                    os.kill(p.pid, signal.SIGSTOP)
-                                except Exception:
-                                    pass
+                    if 0 <= i < len(tiles):
+                        replace_tile(i)
             time.sleep(0.02)
     finally:
         try:
