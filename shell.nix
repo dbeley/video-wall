@@ -7,6 +7,7 @@ in pkgs.mkShell {
     python3
     pythonPackages.pygame
     pythonPackages.moviepy
+    ruff
   ];
 
 }
