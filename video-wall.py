@@ -3,16 +3,21 @@ import argparse
 import math
 import os
 import random
-import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# ---------------- Utilities ----------------
-
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
+
+
+def require_bin(name: str):
+    if not shutil.which(name):
+        raise SystemExit(
+            f"'{name}' not found in PATH. Please install FFmpeg (ffplay/ffprobe)."
+        )
 
 
 def ffprobe_duration(path: Path) -> float | None:
@@ -39,12 +44,37 @@ def ffprobe_duration(path: Path) -> float | None:
         return None
 
 
+def ffprobe_has_audio(path: Path) -> bool:
+    try:
+        out = (
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "a",
+                    "-show_entries",
+                    "stream=index",
+                    "-of",
+                    "csv=p=0",
+                    str(path),
+                ],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
+        return bool(out)
+    except Exception:
+        return False
+
+
 def random_seek_50_75_pct(path: Path) -> float:
     dur = ffprobe_duration(path) or 0.0
     if dur <= 0:
         return 0.0
     start = random.uniform(0.50, 0.75) * dur
-    # leave a small buffer before the end so we don’t instantly EOF
     return min(start, max(0.0, dur - 3.0))
 
 
@@ -59,7 +89,6 @@ def pick_files(pool: list[Path], n: int) -> list[Path]:
 def grid_for_count(n: int, rows: int | None, cols: int | None):
     if rows and cols:
         return rows, cols
-    # choose a compact grid automatically
     if not cols:
         cols = math.ceil(math.sqrt(n))
     if not rows:
@@ -68,13 +97,10 @@ def grid_for_count(n: int, rows: int | None, cols: int | None):
 
 
 def make_xstack_layout(n: int, rows: int, cols: int, cell_w: int, cell_h: int) -> str:
-    # layout is "x_y|x_y|..." pixel positions for each input after per-tile scaling/padding
     coords = []
     for i in range(n):
         r, c = divmod(i, cols)
-        x = c * cell_w
-        y = r * cell_h
-        coords.append(f"{x}_{y}")
+        coords.append(f"{c * cell_w}_{r * cell_h}")
     return "|".join(coords)
 
 
@@ -87,103 +113,73 @@ def build_ffplay_command(
     volume: float,
     loop: bool,
     window_title: str,
+    verbose: bool,
 ) -> list[str]:
-    """
-    Build a single ffplay command with N inputs, random -ss per input,
-    filter_complex: per-tile scale+pad -> xstack, and audio amix.
-    """
-
     n = len(files)
-    # Inputs (with -ss for fast seek) and loop flags
-    args = ["ffplay", "-v", "error", "-nostats"]
-    # Better A/V sync in mosaics
+
+    args = ["ffplay"]
+    # Show logs if verbose, else keep output quiet
+    if verbose:
+        args += ["-v", "info"]
+    else:
+        args += ["-v", "error", "-nostats"]
+
+    # Lower latency flags (helpful for mosaics)
     args += ["-fflags", "nobuffer", "-flags", "low_delay"]
 
-    # Prepend per-input options (-ss must be before -i for fast seek)
-    per_input_labels_v = []
-    per_input_labels_a = []
-
-    filter_parts = []
-
-    for idx, f in enumerate(files):
-        ss = random_seek_50_75_pct(f)
+    # Per-input options must come before corresponding -i
+    for f in files:
         if loop:
             args += ["-stream_loop", "-1"]
-        args += ["-ss", f"{ss:.3f}", "-i", str(f)]
+        args += [
+            "-ss",
+            f"{random_seek_50_75_pct(f):.3f}",
+            "-i",
+            # os.path.abspath(str(f)),
+            str(f.resolve()),
+        ]
 
-    # Build per-input video chains: scale to fit and pad to fill the cell
+    filter_parts = []
+    vlabels = []
+    # Ensure consistent pixel format per tile (avoids xstack pixfmt complaints)
     for idx in range(n):
         vin = f"[{idx}:v]"
         vout = f"[v{idx}]"
-        per_input_labels_v.append(vout)
-        chain = (
-            f"{vin}scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
-            f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:black{vout}"
+        vlabels.append(vout)
+        filter_parts.append(
+            f"{vin}"
+            f"scale={cell_w}:{cell_h}:force_original_aspect_ratio=decrease,"
+            f"pad={cell_w}:{cell_h}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"format=yuv420p{vout}"
         )
-        filter_parts.append(chain)
 
-    # Per-input audio scaling (volume) before amix
-    for idx in range(n):
+    # Only include audio chains for inputs that actually have audio
+    audio_idxs = [i for i, f in enumerate(files) if ffprobe_has_audio(f)]
+    alabels = []
+    for idx in audio_idxs:
         ain = f"[{idx}:a]"
         aout = f"[a{idx}]"
-        per_input_labels_a.append(aout)
-        # Some files may have no audio — volume filter will error if stream absent.
-        # We guard by using "anullsrc" fallback via amerge with a silent source only when needed.
-        # BUT ffplay doesn’t support conditional graphs; easiest is to ignore missing
-        # and let amix handle fewer streams (we’ll map only existing audio streams).
-        # We’ll include the label; ffplay will error if input lacks audio.
-        # Workaround: use "aresample=async=1:min_hard_comp=0.100" to keep clocks happy.
+        alabels.append(aout)
         filter_parts.append(
             f"{ain}volume={volume},aresample=async=1:min_hard_comp=0.100{aout}"
         )
 
-    # xstack layout
+    # xstack for video
     layout = make_xstack_layout(n, rows, cols, cell_w, cell_h)
+    filter_parts.append(f"{''.join(vlabels)}xstack=inputs={n}:layout={layout}[V]")
+
+    maps = ["-map", "[V]"]
+    if alabels:
+        # dropout_transition smooths if a stream ends (when not looping)
+        filter_parts.append(
+            f"{''.join(alabels)}amix=inputs={len(alabels)}:dropout_transition=200[aout]"
+        )
+        maps += ["-map", "[aout]"]
+    else:
+        maps += ["-an"]
+
     total_w = cols * cell_w
     total_h = rows * cell_h
-
-    # xstack requires exactly inputs=N
-    vinputs = "".join(per_input_labels_v)
-    filter_parts.append(f"{vinputs}xstack=inputs={n}:layout={layout}[V]")
-
-    # amix on as many audio labels as we actually have
-    # If some inputs truly lack audio, referencing them breaks. So detect via ffprobe now:
-    have_audio = []
-    for idx, f in enumerate(files):
-        try:
-            has_a = (
-                subprocess.check_output(
-                    [
-                        "ffprobe",
-                        "-v",
-                        "error",
-                        "-select_streams",
-                        "a",
-                        "-show_entries",
-                        "stream=index",
-                        "-of",
-                        "csv=p=0",
-                        str(f),
-                    ],
-                    stderr=subprocess.DEVNULL,
-                )
-                .decode()
-                .strip()
-            )
-            if has_a:
-                have_audio.append(idx)
-        except Exception:
-            pass
-
-    if have_audio:
-        ainputs = "".join(f"[a{idx}]" for idx in have_audio)
-        # dropout_transition smooths when one stream ends (if not looping)
-        filter_parts.append(
-            f"{ainputs}amix=inputs={len(have_audio)}:dropout_transition=200[aout]"
-        )
-        maps = ["-map", "[V]", "-map", "[aout]"]
-    else:
-        maps = ["-map", "[V]", "-an"]
 
     filter_complex = ";".join(filter_parts)
     args += [
@@ -195,21 +191,14 @@ def build_ffplay_command(
         "-window_title",
         window_title,
     ]
-    # Hint: ffplay understands keyboard controls in its window.
-    # We’ll pause via signals from Python for reliability across WMs.
-
     return args
 
 
-# ---------------- Controller ----------------
-
-
-def launch_ffplay(cmd: list[str]) -> subprocess.Popen:
+def launch_ffplay(cmd: list[str], env: dict, verbose: bool) -> subprocess.Popen:
+    stdout = None if verbose else subprocess.DEVNULL
+    stderr = None if verbose else subprocess.DEVNULL
     return subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cmd, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, env=env
     )
 
 
@@ -227,7 +216,7 @@ def resume_proc(p: subprocess.Popen):
         pass
 
 
-def run_controller(
+def controller(
     folder: Path,
     count: int,
     rows: int | None,
@@ -238,11 +227,13 @@ def run_controller(
     loop: bool,
     exts: tuple[str, ...],
     seed: int | None,
+    sdl_driver: str | None,
+    verbose: bool,
 ):
     if seed is not None:
         random.seed(seed)
 
-    pool = [p for p in folder.iterdir() if p.suffix.lower() in exts]
+    pool = [p for p in folder.rglob("*") if p.suffix.lower() in exts]
     if len(pool) < count:
         raise SystemExit(
             f"Need at least {count} videos with extensions {exts} in {folder}"
@@ -251,7 +242,11 @@ def run_controller(
     files = pick_files(pool, count)
     rows, cols = grid_for_count(count, rows, cols)
 
-    def build_and_launch(title="Video Wall"):
+    env = os.environ.copy()
+    if sdl_driver:
+        env["SDL_VIDEODRIVER"] = sdl_driver  # e.g., 'wayland' or 'x11'
+
+    def start_proc(title="Video Wall"):
         cmd = build_ffplay_command(
             files=files,
             rows=rows,
@@ -261,21 +256,25 @@ def run_controller(
             volume=volume,
             loop=loop,
             window_title=title,
+            verbose=verbose,
         )
-        return launch_ffplay(cmd)
+        if verbose:
+            print("FFPLAY CMD:\n", " ".join(cmd), flush=True)
+        return launch_ffplay(cmd, env, verbose)
 
-    proc = build_and_launch()
+    proc = start_proc()
     paused = False
 
     print(
-        "\nControls:\n"
+        "\nControls (focus the TERMINAL, not the ffplay window):\n"
         "  SPACE  = pause/resume\n"
         "  r      = replace a random tile\n"
-        "  1..8   = replace a specific tile (1-indexed)\n"
+        "  1..8   = replace specific tile (1-indexed)\n"
         "  q      = quit\n"
+        "Tip: ffplay window itself also supports 'p' to pause, 'm' to mute, arrow keys to seek.\n"
     )
 
-    # raw key reading (POSIX)
+    # Raw key reading (POSIX)
     try:
         import termios, tty, select
 
@@ -283,10 +282,11 @@ def run_controller(
         old = termios.tcgetattr(fd)
         tty.setcbreak(fd)
         while True:
-            # restart if died (e.g., user closed window)
             if proc.poll() is not None:
-                # respawn with same files (new random seeks)
-                proc = build_and_launch()
+                # Window was closed or ffplay crashed: restart with a fresh graph (new random seeks)
+                proc = start_proc()
+                if paused:
+                    pause_proc(proc)
 
             dr, _, _ = select.select([sys.stdin], [], [], 0.1)
             if dr:
@@ -302,18 +302,16 @@ def run_controller(
                         paused = False
                 elif ch == "r":
                     idx = random.randrange(len(files))
-                    # pick a different file when possible
                     candidates = [p for p in pool if p not in files]
                     files[idx] = (
                         random.choice(candidates) if candidates else random.choice(pool)
                     )
-                    # restart ffplay with new graph
                     try:
                         proc.terminate()
                         time.sleep(0.1)
                     except Exception:
                         pass
-                    proc = build_and_launch()
+                    proc = start_proc()
                     if paused:
                         pause_proc(proc)
                 elif ch.isdigit():
@@ -330,7 +328,7 @@ def run_controller(
                             time.sleep(0.1)
                         except Exception:
                             pass
-                        proc = build_and_launch()
+                        proc = start_proc()
                         if paused:
                             pause_proc(proc)
             time.sleep(0.02)
@@ -347,46 +345,44 @@ def run_controller(
             pass
 
 
-# ---------------- Main ----------------
-
-
 def main():
+    require_bin("ffplay")
+    require_bin("ffprobe")
+
     ap = argparse.ArgumentParser(
-        description="Single-window video wall using ffplay (xstack + amix)"
+        description="Single-window video wall (ffplay xstack + amix)"
     )
     ap.add_argument("folder", type=Path, help="Folder containing videos")
     ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–8)")
     ap.add_argument("--rows", type=int, help="Rows (auto if omitted)")
     ap.add_argument("--cols", type=int, help="Columns (auto if omitted)")
+    ap.add_argument("--cell-width", type=int, default=640, help="Per-tile width")
+    ap.add_argument("--cell-height", type=int, default=360, help="Per-tile height")
     ap.add_argument(
-        "--cell-width", type=int, default=640, help="Per-tile width (pixels)"
-    )
-    ap.add_argument(
-        "--cell-height", type=int, default=360, help="Per-tile height (pixels)"
-    )
-    ap.add_argument(
-        "--volume",
-        type=float,
-        default=0.6,
-        help="Per-input volume multiplier (0.0–1.0+)",
+        "--volume", type=float, default=0.6, help="Per-input volume pre-mix (0.0–1.0+)"
     )
     ap.add_argument("--loop", action="store_true", help="Loop inputs")
     ap.add_argument(
-        "--exts",
-        default=",".join(DEFAULT_EXTS),
-        help="Comma-separated extensions to include",
+        "--exts", default=",".join(DEFAULT_EXTS), help="Comma-separated extensions"
     )
     ap.add_argument("--seed", type=int, help="Random seed")
+    ap.add_argument(
+        "--sdl-driver", choices=["x11", "wayland"], help="Force SDL video driver"
+    )
+    ap.add_argument(
+        "--verbose", action="store_true", help="Show ffplay command and logs"
+    )
     args = ap.parse_args()
 
     if args.count < 4 or args.count > 8:
         raise SystemExit("Please choose --count between 4 and 8.")
 
-    exts = tuple(x.strip().lower() for x in args.exts.split(",") if x.strip())
     if not args.folder.is_dir():
         raise SystemExit(f"{args.folder} is not a directory.")
 
-    run_controller(
+    exts = tuple(x.strip().lower() for x in args.exts.split(",") if x.strip())
+
+    controller(
         folder=args.folder,
         count=args.count,
         rows=args.rows,
@@ -397,6 +393,8 @@ def main():
         loop=args.loop,
         exts=exts,
         seed=args.seed,
+        sdl_driver=args.sdl_driver,
+        verbose=args.verbose,
     )
 
 
