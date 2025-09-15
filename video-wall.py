@@ -1,63 +1,60 @@
 #!/usr/bin/env python3
-import argparse, math, os, random, shutil, signal, subprocess, sys, time
+import argparse, math, os, random, shutil, signal, subprocess, sys, time, glob
 from pathlib import Path
 
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 
 
+# -------- Utils --------
 def need(binname: str):
     if not shutil.which(binname):
         raise SystemExit(f"Missing '{binname}' in PATH.")
 
 
-def ffprobe_duration(path: Path) -> float | None:
+def run_cmd(argv: list[str]) -> str:
     try:
-        out = (
-            subprocess.check_output(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=nw=1:nk=1",
-                    str(path),
-                ],
-                stderr=subprocess.DEVNULL,
-            )
-            .decode()
-            .strip()
+        return subprocess.check_output(argv, stderr=subprocess.STDOUT).decode(
+            "utf-8", "ignore"
         )
-        return float(out) if out else None
+    except Exception:
+        return ""
+
+
+def ffprobe_duration(path: Path) -> float | None:
+    out = run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+            str(path),
+        ]
+    )
+    try:
+        return float(out.strip()) if out.strip() else None
     except Exception:
         return None
 
 
 def ffprobe_has_audio(path: Path) -> bool:
-    try:
-        out = (
-            subprocess.check_output(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "a",
-                    "-show_entries",
-                    "stream=index",
-                    "-of",
-                    "csv=p=0",
-                    str(path),
-                ],
-                stderr=subprocess.DEVNULL,
-            )
-            .decode()
-            .strip()
-        )
-        return bool(out)
-    except Exception:
-        return False
+    out = run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
+    )
+    return bool(out.strip())
 
 
 def random_seek_50_75(path: Path) -> float:
@@ -90,6 +87,69 @@ def layout_str(n: int, rows: int, cols: int, cw: int, ch: int) -> str:
     return "|".join(f"{(i % cols) * cw}_{(i // cols) * ch}" for i in range(n))
 
 
+# -------- HW Accel auto-detect --------
+def list_hwaccels() -> set[str]:
+    out = run_cmd(["ffmpeg", "-hide_banner", "-hwaccels"])
+    # Output looks like:
+    # Hardware acceleration methods:
+    # vdpau
+    # vaapi
+    # cuda
+    # ...
+    accels = set()
+    for line in out.splitlines():
+        s = line.strip().lower()
+        if s and not s.startswith("hardware acceleration"):
+            accels.add(s)
+    return accels
+
+
+def find_vaapi_device() -> str | None:
+    # Try common render nodes
+    for path in sorted(glob.glob("/dev/dri/renderD*")):
+        if os.access(path, os.R_OK | os.W_OK):
+            return path
+    return None
+
+
+def choose_hwaccel(pref: str | None = None) -> tuple[str | None, dict]:
+    """
+    Returns (accel, extra_global_opts_dict)
+    accel in {'cuda','vaapi',None}
+    """
+    # user override
+    if pref:
+        p = pref.lower()
+        if p in {"off", "none"}:
+            return None, {}
+        if p in {"cuda", "vaapi"}:
+            if p == "vaapi":
+                dev = find_vaapi_device()
+                if dev:
+                    return "vaapi", {"-vaapi_device": dev}
+                # fallback off if no device
+                return None, {}
+            return "cuda", {}
+        if p == "auto":
+            pass  # fall through to auto
+        else:
+            # unknown → treat as off
+            return None, {}
+
+    accels = list_hwaccels()
+    # Prefer CUDA if present
+    if "cuda" in accels:
+        return "cuda", {}
+    # Then VAAPI if render node exists
+    if "vaapi" in accels:
+        dev = find_vaapi_device()
+        if dev:
+            return "vaapi", {"-vaapi_device": dev}
+    # Could add qsv/videotoolbox here if you need
+    return None, {}
+
+
+# -------- Command builder --------
 def build_ffmpeg_cmd(
     files: list[Path],
     rows: int,
@@ -98,34 +158,44 @@ def build_ffmpeg_cmd(
     ch: int,
     loop: bool,
     vol: float,
-    vcodec: str,
-    acodec: str,
-    muxer: str,
+    fast: bool,
     fps: int | None,
-    hwaccel: str | None,
+    hwaccel_mode: str | None,
+    hw_global_opts: dict,
     verbose: bool,
     no_audio: bool,
 ) -> list[str]:
     n = len(files)
     args = ["ffmpeg", "-hide_banner", "-loglevel", "info" if verbose else "error"]
 
-    # Optional hardware accel for decoding (helps when not using rawvideo; may still help)
-    if hwaccel:
-        args += ["-hwaccel", hwaccel]
-        # best-effort; not forcing output_format to keep filters happy
+    # Global HW opts (e.g., -vaapi_device /dev/dri/renderD128)
+    for k, v in hw_global_opts.items():
+        args += [k, v]
 
-    # inputs with random -ss per file
+    # Per-input: hwaccel + seek + input
     for f in files:
         if loop:
             args += ["-stream_loop", "-1"]
+        if hwaccel_mode == "cuda":
+            args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        elif hwaccel_mode == "vaapi":
+            args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
+        # else: software decode
         args += ["-ss", f"{random_seek_50_75(f):.3f}", "-i", str(f.resolve())]
 
-    # build filter graph
+    # Build filter graph
     flt, vouts, with_audio = [], [], []
     for i, f in enumerate(files):
+        pre = ""
+        # If we decoded to hardware frames, download to system memory for CPU filters
+        if hwaccel_mode in {"cuda", "vaapi"}:
+            # nv12 is a safe intermediate for both
+            pre = "hwdownload,format=nv12,"
+
         vouts.append(f"[v{i}]")
         flt.append(
-            f"[{i}:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
+            f"[{i}:v]{pre}"
+            f"scale={cw}:{ch}:force_original_aspect_ratio=decrease,"
             f"pad={cw}:{ch}:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p[v{i}]"
         )
         if not no_audio and ffprobe_has_audio(f):
@@ -150,31 +220,51 @@ def build_ffmpeg_cmd(
 
     args += ["-filter_complex", ";".join(flt), *maps, "-s", f"{total_w}x{total_h}"]
 
-    # FPS cap (big CPU saver)
+    # FPS cap → big CPU saver
     if fps:
         args += ["-r", str(fps)]
 
-    # --- Fast path: raw video + raw PCM audio in a lightweight container (nut) ---
-    args += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
-    if "-an" not in maps:
-        args += ["-c:a", acodec, "-ar", "48000"]
+    # FAST path: rawvideo + PCM in a lightweight container (nut) over the pipe
+    if fast:
+        args += ["-c:v", "rawvideo", "-pix_fmt", "yuv420p"]
+        if "-an" not in maps:
+            args += ["-c:a", "pcm_s16le", "-ar", "48000"]
+        else:
+            args += ["-an"]
+        args += ["-f", "nut", "-"]
     else:
-        args += ["-an"]
+        # Heavier (encode H.264 + AAC) — not recommended if CPU is tight
+        args += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        if "-an" not in maps:
+            args += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        else:
+            args += ["-an"]
+        args += ["-f", "matroska", "-"]
 
-    # Output through a container to carry both rawvideo + pcm over one pipe
-    args += ["-f", muxer, "-"]
     return args
 
 
-def launch_pipeline(ffmpeg_cmd: list[str], viewer_title: str, verbose: bool):
-    # Single-window playback via ffplay reading from stdin
+def launch_pipeline(ffmpeg_cmd: list[str], title: str, verbose: bool):
     ffplay_cmd = [
         "ffplay",
         "-loglevel",
         "info" if verbose else "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
         "-autoexit",
         "-window_title",
-        viewer_title,
+        title,
         "-i",
         "pipe:0",
     ]
@@ -199,17 +289,20 @@ def kill_proc(p):
             pass
 
 
+# -------- Main controller --------
 def main():
     need("ffmpeg")
     need("ffprobe")
     need("ffplay")
 
-    ap = argparse.ArgumentParser(description="Single-window video wall (fast mode)")
+    ap = argparse.ArgumentParser(
+        description="Single-window video wall (fast mode + auto HW accel)"
+    )
     ap.add_argument("folder", type=Path, help="Folder with videos")
     ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–8)")
     ap.add_argument("--rows", type=int)
     ap.add_argument("--cols", type=int)
-    ap.add_argument("--cell-width", type=int, default=480)  # smaller tiles by default
+    ap.add_argument("--cell-width", type=int, default=480)
     ap.add_argument("--cell-height", type=int, default=270)
     ap.add_argument("--volume", type=float, default=0.5, help="Per-input pre-mix gain")
     ap.add_argument("--loop", action="store_true", help="Loop inputs")
@@ -217,20 +310,21 @@ def main():
     ap.add_argument("--seed", type=int)
     ap.add_argument("--verbose", action="store_true")
 
-    # FAST toggles
+    # Fast toggles
     ap.add_argument(
-        "--fast",
-        action="store_true",
-        help="Enable rawvideo+pcm, fps cap (very low CPU)",
+        "--fast", action="store_true", help="Use rawvideo+pcm and FPS cap (low CPU)"
     )
     ap.add_argument(
-        "--fps", type=int, default=30, help="Output FPS cap (works best with --fast)"
+        "--fps", type=int, default=15, help="Output FPS cap (use with --fast)"
     )
-    ap.add_argument("--no-audio", action="store_true", help="Disable audio entirely")
+    ap.add_argument("--no-audio", action="store_true", help="Disable audio mix")
 
-    # HW accel hint (may or may not help depending on drivers/pipeline)
+    # HW accel: auto/off/cuda/vaapi (default auto)
     ap.add_argument(
-        "--hwaccel", choices=["vaapi", "cuda", "vdpau", "dxva2", "videotoolbox"]
+        "--hwaccel",
+        default="auto",
+        choices=["auto", "off", "cuda", "vaapi"],
+        help="Hardware decode mode (auto=detect)",
     )
 
     args = ap.parse_args()
@@ -245,17 +339,18 @@ def main():
     exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
     pool = [p for p in args.folder.iterdir() if p.suffix.lower() in exts]
     if len(pool) < args.count:
-        raise SystemExit(f"Need at least {args.count} videos with {exts}")
-
+        raise SystemExit(f"Need at least {args.count} videos with extensions {exts}")
     files = pick(pool, args.count)
     rows, cols = grid(args.count, args.rows, args.cols)
 
-    # Choose codecs/container for fast vs normal
-    if args.fast:
-        vcodec, acodec, muxer = "rawvideo", "pcm_s16le", "nut"
-    else:
-        # (still works, but CPU heavier)
-        vcodec, acodec, muxer = "libx264", "aac", "matroska"
+    # Choose HW accel
+    hwaccel_mode, hw_global_opts = choose_hwaccel(args.hwaccel)
+    if args.verbose:
+        print(f"[info] HW accel: {hwaccel_mode or 'software'}", end="")
+        if hwaccel_mode == "vaapi" and "-vaapi_device" in hw_global_opts:
+            print(f" (device {hw_global_opts['-vaapi_device']})")
+        else:
+            print()
 
     def build_cmd():
         return build_ffmpeg_cmd(
@@ -266,16 +361,15 @@ def main():
             ch=args.cell_height,
             loop=args.loop,
             vol=args.volume,
-            vcodec=vcodec,
-            acodec=acodec,
-            muxer=muxer,
+            fast=args.fast,
             fps=args.fps if args.fast else None,
-            hwaccel=args.hwaccel,
+            hwaccel_mode=hwaccel_mode,
+            hw_global_opts=hw_global_opts,
             verbose=args.verbose,
             no_audio=args.no_audio,
         )
 
-    ffmpeg, ffplay = launch_pipeline(build_cmd(), "Video Wall (fast)", args.verbose)
+    ffmpeg, ffplay = launch_pipeline(build_cmd(), "Video Wall (fast+HW)", args.verbose)
     paused = False
 
     print(
@@ -295,12 +389,11 @@ def main():
         tty.setcbreak(fd)
 
         while True:
-            # if pipeline died (closed window), restart
             if ffplay.poll() is not None or ffmpeg.poll() is not None:
                 kill_proc(ffplay)
                 kill_proc(ffmpeg)
                 ffmpeg, ffplay = launch_pipeline(
-                    build_cmd(), "Video Wall (fast)", args.verbose
+                    build_cmd(), "Video Wall (fast+HW)", args.verbose
                 )
                 if paused:
                     for p in (ffmpeg, ffplay):
@@ -338,7 +431,7 @@ def main():
                     kill_proc(ffplay)
                     kill_proc(ffmpeg)
                     ffmpeg, ffplay = launch_pipeline(
-                        build_cmd(), "Video Wall (fast)", args.verbose
+                        build_cmd(), "Video Wall (fast+HW)", args.verbose
                     )
                     if paused:
                         for p in (ffmpeg, ffplay):
@@ -358,7 +451,7 @@ def main():
                         kill_proc(ffplay)
                         kill_proc(ffmpeg)
                         ffmpeg, ffplay = launch_pipeline(
-                            build_cmd(), "Video Wall (fast)", args.verbose
+                            build_cmd(), "Video Wall (fast+HW)", args.verbose
                         )
                         if paused:
                             for p in (ffmpeg, ffplay):
