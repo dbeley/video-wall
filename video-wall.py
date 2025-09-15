@@ -159,7 +159,6 @@ def build_ffmpeg_cmd(
     loop: bool,
     vol: float,
     fast: bool,
-    fps: int | None,
     hwaccel_mode: str | None,
     hw_global_opts: dict,
     verbose: bool,
@@ -219,10 +218,6 @@ def build_ffmpeg_cmd(
     total_w, total_h = cols * cw, rows * ch
 
     args += ["-filter_complex", ";".join(flt), *maps, "-s", f"{total_w}x{total_h}"]
-
-    # FPS cap → big CPU saver
-    if fps:
-        args += ["-r", str(fps)]
 
     # FAST path: rawvideo + PCM in a lightweight container (nut) over the pipe
     if fast:
@@ -311,20 +306,15 @@ def main():
     ap.add_argument("--verbose", action="store_true")
 
     # Fast toggles
-    ap.add_argument(
-        "--fast", action="store_true", help="Use rawvideo+pcm and FPS cap (low CPU)"
-    )
-    ap.add_argument(
-        "--fps", type=int, default=15, help="Output FPS cap (use with --fast)"
-    )
+    ap.add_argument("--fast", action="store_true", help="Use rawvideo+pcm (low CPU)")
     ap.add_argument("--no-audio", action="store_true", help="Disable audio mix")
 
     # HW accel: auto/off/cuda/vaapi (default auto)
     ap.add_argument(
         "--hwaccel",
-        default="auto",
+        default="off",
         choices=["auto", "off", "cuda", "vaapi"],
-        help="Hardware decode mode (auto=detect)",
+        help="Hardware decode mode (auto=off)",
     )
 
     args = ap.parse_args()
@@ -362,7 +352,6 @@ def main():
             loop=args.loop,
             vol=args.volume,
             fast=args.fast,
-            fps=args.fps if args.fast else None,
             hwaccel_mode=hwaccel_mode,
             hw_global_opts=hw_global_opts,
             verbose=args.verbose,
