@@ -294,7 +294,7 @@ def main():
         description="Single-window video wall (fast mode + auto HW accel)"
     )
     ap.add_argument("folder", type=Path, help="Folder with videos")
-    ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–8)")
+    ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–9)")
     ap.add_argument("--rows", type=int)
     ap.add_argument("--cols", type=int)
     ap.add_argument("--cell-width", type=int, default=480)
@@ -319,8 +319,8 @@ def main():
 
     args = ap.parse_args()
 
-    if args.count < 4 or args.count > 8:
-        raise SystemExit("Choose --count between 4 and 8.")
+    if args.count < 4 or args.count > 9:
+        raise SystemExit("Choose --count between 4 and 9.")
     if not args.folder.is_dir():
         raise SystemExit(f"{args.folder} is not a directory.")
     if args.seed is not None:
@@ -365,7 +365,7 @@ def main():
         "\nControls (focus terminal):\n"
         "  SPACE  = pause/resume\n"
         "  r      = replace a random tile\n"
-        "  1..8   = replace a specific tile (1-indexed)\n"
+        "  1..9   = replace a specific tile (1-indexed)\n"
         "  q      = quit\n"
     )
 
