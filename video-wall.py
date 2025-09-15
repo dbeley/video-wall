@@ -91,11 +91,13 @@ def normalize_seek(path: Path, offset: float, loop: bool) -> float:
     return max(0.0, offset)
 
 
-def random_seek_50_75(path: Path, loop: bool) -> float:
+def random_seek(
+    path: Path, loop: bool, start_percentage: float, end_percentage: float
+) -> float:
     dur = get_metadata(path).duration or 0.0
     if dur <= 0:
         return 0.0
-    start = random.uniform(0.50, 0.75) * dur
+    start = random.uniform(start_percentage, end_percentage) * dur
     return normalize_seek(path, start, loop)
 
 
@@ -348,7 +350,7 @@ def main():
         description="Single-window video wall (fast mode + auto HW accel)"
     )
     ap.add_argument("folder", type=Path, help="Folder with videos")
-    ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–9)")
+    ap.add_argument("-n", "--count", type=int, default=4, help="Number of tiles (4–16)")
     ap.add_argument("--rows", type=int)
     ap.add_argument("--cols", type=int)
     ap.add_argument("--cell-width", type=int, default=480)
@@ -385,8 +387,8 @@ def main():
 
     args = ap.parse_args()
 
-    if args.count < 4 or args.count > 9:
-        raise SystemExit("Choose --count between 4 and 9.")
+    if args.count < 4 or args.count > 16:
+        raise SystemExit("Choose --count between 4 and 16.")
     if not args.folder.is_dir():
         raise SystemExit(f"{args.folder} is not a directory.")
     if args.seed is not None:
@@ -400,7 +402,12 @@ def main():
         raise SystemExit(f"Need at least {args.count} videos with extensions {exts}")
     initial_paths = pick(pool, args.count)
     tiles = [
-        TileState(path=path, seek=random_seek_50_75(path, args.loop))
+        TileState(
+            path=path,
+            seek=random_seek(
+                path, args.loop, args.start_percentage, args.end_percentage
+            ),
+        )
         for path in initial_paths
     ]
     rows, cols = grid(args.count, args.rows, args.cols)
@@ -451,7 +458,9 @@ def main():
                 meta = tile.metadata
                 dur = meta.duration or 0.0
                 if dur > 0 and raw_seek >= dur - 0.5:
-                    tile.seek = random_seek_50_75(tile.path, args.loop)
+                    tile.seek = random_seek(
+                        tile.path, args.loop, args.start_percentage, args.end_percentage
+                    )
                     continue
             tile.seek = normalize_seek(tile.path, raw_seek, args.loop)
         pipeline_start = now
@@ -481,7 +490,10 @@ def main():
         candidates = [p for p in pool if p not in active_paths]
         new_path = random.choice(candidates) if candidates else random.choice(pool)
         tiles[index] = TileState(
-            path=new_path, seek=random_seek_50_75(new_path, args.loop)
+            path=new_path,
+            seek=random_seek(
+                new_path, args.loop, args.start_percentage, args.end_percentage
+            ),
         )
         restart_pipeline()
 
@@ -499,7 +511,7 @@ def main():
         "\nControls (focus terminal):\n"
         "  SPACE  = pause/resume\n"
         "  r      = replace a random tile\n"
-        "  1..8   = replace a specific tile (1-indexed)\n"
+        "  1..9   = replace a specific tile (1-indexed)\n"
         "  f/F + #= seek forward 10s/30s for tile #\n"
         "  b/B + #= seek backward 10s/30s for tile #\n"
         "  q      = quit\n"
