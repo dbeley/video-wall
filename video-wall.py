@@ -57,11 +57,13 @@ def ffprobe_has_audio(path: Path) -> bool:
     return bool(out.strip())
 
 
-def random_seek_50_75(path: Path) -> float:
+def random_seek(
+    path: Path, start_percentage: float = 0.5, end_percentage: float = 0.75
+) -> float:
     dur = ffprobe_duration(path) or 0.0
     if dur <= 0:
         return 0.0
-    start = random.uniform(0.50, 0.75) * dur
+    start = random.uniform(start_percentage, end_percentage) * dur
     return min(start, max(0.0, dur - 3.0))
 
 
@@ -163,6 +165,8 @@ def build_ffmpeg_cmd(
     hw_global_opts: dict,
     verbose: bool,
     no_audio: bool,
+    start_percentage: float,
+    end_percentage: float,
 ) -> list[str]:
     n = len(files)
     args = ["ffmpeg", "-hide_banner", "-loglevel", "info" if verbose else "error"]
@@ -180,7 +184,12 @@ def build_ffmpeg_cmd(
         elif hwaccel_mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
         # else: software decode
-        args += ["-ss", f"{random_seek_50_75(f):.3f}", "-i", str(f.resolve())]
+        args += [
+            "-ss",
+            f"{random_seek(f, start_percentage, end_percentage):.3f}",
+            "-i",
+            str(f.resolve()),
+        ]
 
     # Build filter graph
     flt, vouts, with_audio = [], [], []
@@ -304,6 +313,18 @@ def main():
     ap.add_argument("--exts", default=",".join(DEFAULT_EXTS))
     ap.add_argument("--seed", type=int)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--start_percentage",
+        type=float,
+        default=0.5,
+        help="Start of the duration randomization",
+    )
+    ap.add_argument(
+        "--end_percentage",
+        type=float,
+        default=0.75,
+        help="End of the duration randomization",
+    )
 
     # Fast toggles
     ap.add_argument("--fast", action="store_true", help="Use rawvideo+pcm (low CPU)")
@@ -356,6 +377,8 @@ def main():
             hw_global_opts=hw_global_opts,
             verbose=args.verbose,
             no_audio=args.no_audio,
+            start_percentage=args.start_percentage,
+            end_percentage=args.end_percentage,
         )
 
     ffmpeg, ffplay = launch_pipeline(build_cmd(), "Video Wall (fast+HW)", args.verbose)
