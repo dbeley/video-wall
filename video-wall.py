@@ -50,8 +50,9 @@ def get_metadata(path: Path) -> VideoMeta:
             "error",
             "-select_streams",
             "a",
+            # Use colon to separate sections: format=...:stream=...
             "-show_entries",
-            "format=duration,stream=index",
+            "format=duration:stream=index",
             "-of",
             "json",
             str(path),
@@ -211,6 +212,10 @@ def build_ffmpeg_cmd(
     no_audio: bool,
     start_percentage: float,
     end_percentage: float,
+    audio_mode: str,
+    audio_tile_index: int | None,
+    audio_rate: int,
+    filter_threads: int | None,
 ) -> list[str]:
     n = len(tiles)
     args = ["ffmpeg", "-hide_banner", "-loglevel", "info" if verbose else "error"]
@@ -218,6 +223,8 @@ def build_ffmpeg_cmd(
     # Global HW opts (e.g., -vaapi_device /dev/dri/renderD128)
     for k, v in hw_global_opts.items():
         args += [k, v]
+    if filter_threads and filter_threads > 0:
+        args += ["-filter_threads", str(filter_threads)]
 
     # Per-input: hwaccel + seek + input
     for tile in tiles:
@@ -256,9 +263,8 @@ def build_ffmpeg_cmd(
         meta = tile.metadata
         if not no_audio and meta.has_audio:
             with_audio.append(i)
-            flt.append(
-                f"[{i}:a]volume={vol},aresample=async=1:min_hard_comp=0.100[a{i}]"
-            )
+            # Lighten CPU: apply volume per stream, resample once after mix
+            flt.append(f"[{i}:a]volume={vol}[a{i}]")
 
     layout = layout_str(n, rows, cols, cw, ch)
     flt.append(f"{''.join(vouts)}xstack=inputs={n}:layout={layout}[V]")
@@ -266,10 +272,23 @@ def build_ffmpeg_cmd(
     maps = ["-map", "[V]"]
     want_audio = not no_audio and bool(with_audio)
     if want_audio:
-        flt.append(
-            f"{''.join(f'[a{i}]' for i in with_audio)}amix=inputs={len(with_audio)}:dropout_transition=200[A]"
-        )
-        maps += ["-map", "[A]"]
+        if audio_mode == "one":
+            # Choose a single tile's audio (1-indexed external, 0-indexed internal)
+            chosen = None
+            if audio_tile_index is not None and 0 <= audio_tile_index < len(tiles):
+                if audio_tile_index in with_audio:
+                    chosen = audio_tile_index
+            if chosen is None:
+                chosen = with_audio[0]
+            flt.append(f"[a{chosen}]aresample=async=1:min_hard_comp=0.100[A]")
+            maps += ["-map", "[A]"]
+        else:
+            # Mix all available audio streams, then resample once
+            flt.append(
+                f"{''.join(f'[a{i}]' for i in with_audio)}amix=inputs={len(with_audio)}:dropout_transition=200[Apre]"
+            )
+            flt.append("[Apre]aresample=async=1:min_hard_comp=0.100[A]")
+            maps += ["-map", "[A]"]
 
     total_w, total_h = cols * cw, rows * ch
 
@@ -279,7 +298,7 @@ def build_ffmpeg_cmd(
     if fast:
         args += ["-c:v", "rawvideo", "-pix_fmt", "yuv420p"]
         if want_audio:
-            args += ["-c:a", "pcm_s16le", "-ar", "48000"]
+            args += ["-c:a", "pcm_s16le", "-ar", str(audio_rate)]
         else:
             args += ["-an"]
         args += ["-f", "nut", "-"]
@@ -296,7 +315,7 @@ def build_ffmpeg_cmd(
             "yuv420p",
         ]
         if want_audio:
-            args += ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+            args += ["-c:a", "aac", "-b:a", "192k", "-ar", str(audio_rate)]
         else:
             args += ["-an"]
         args += ["-f", "matroska", "-"]
@@ -376,6 +395,28 @@ def main():
     # Fast toggles
     ap.add_argument("--fast", action="store_true", help="Use rawvideo+pcm (low CPU)")
     ap.add_argument("--no-audio", action="store_true", help="Disable audio mix")
+    ap.add_argument(
+        "--audio-mode",
+        choices=["mix", "one"],
+        default="mix",
+        help="Mix all audio or use one tile's audio",
+    )
+    ap.add_argument(
+        "--audio-tile",
+        type=int,
+        help="When --audio-mode one, use this 1-indexed tile for audio",
+    )
+    ap.add_argument(
+        "--audio-rate",
+        type=int,
+        default=48000,
+        help="Audio sample rate (Hz), e.g. 44100 or 32000",
+    )
+    ap.add_argument(
+        "--filter-threads",
+        type=int,
+        help="Threads for filter graph (advanced)",
+    )
 
     # HW accel: auto/off/cuda/vaapi (default auto)
     ap.add_argument(
@@ -442,6 +483,10 @@ def main():
             no_audio=args.no_audio,
             start_percentage=args.start_percentage,
             end_percentage=args.end_percentage,
+            audio_mode=args.audio_mode,
+            audio_tile_index=(args.audio_tile - 1) if args.audio_tile else None,
+            audio_rate=args.audio_rate,
+            filter_threads=args.filter_threads,
         )
 
     def update_tile_offsets(finalizing: bool = False):
