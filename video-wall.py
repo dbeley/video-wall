@@ -386,6 +386,20 @@ def main():
     ap.add_argument("--volume", type=float, default=0.5, help="Per-input pre-mix gain")
     ap.add_argument("--loop", action="store_true", help="Loop inputs")
     ap.add_argument("--exts", default=",".join(DEFAULT_EXTS))
+    ap.add_argument(
+        "-R",
+        "--recursive",
+        dest="recursive",
+        action="store_true",
+        default=True,
+        help="Include videos from subdirectories (default)",
+    )
+    ap.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Only include videos in the top-level folder",
+    )
     ap.add_argument("--seed", type=int)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument(
@@ -445,9 +459,24 @@ def main():
         random.seed(args.seed)
 
     exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
-    pool = [
-        p for p in args.folder.iterdir() if p.is_file() and p.suffix.lower() in exts
-    ]
+
+    def collect_videos(root: Path, extensions: tuple[str, ...], recursive: bool) -> list[Path]:
+        if recursive:
+            # Recursively collect files with allowed extensions
+            return [
+                p
+                for p in root.rglob("*")
+                if p.is_file() and p.suffix.lower() in extensions
+            ]
+        else:
+            # Only immediate children
+            return [
+                p
+                for p in root.iterdir()
+                if p.is_file() and p.suffix.lower() in extensions
+            ]
+
+    pool = collect_videos(args.folder, exts, args.recursive)
     if len(pool) < args.count:
         raise SystemExit(f"Need at least {args.count} videos with extensions {exts}")
     initial_paths = pick(pool, args.count)
