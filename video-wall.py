@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-import argparse, json, math, os, random, shutil, signal, subprocess, sys, time, glob
+import argparse
+import glob
+import json
+import math
+import os
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,9 +125,8 @@ class TileState:
 def pick(pool: list[Path], n: int) -> list[Path]:
     if len(pool) < n:
         raise SystemExit(f"Need at least {n} videos.")
-    pool = pool[:]
-    random.shuffle(pool)
-    return pool[:n]
+    # `random.sample` keeps selection unbiased and avoids mutating the source list
+    return random.sample(pool, n)
 
 
 def grid(n: int, rows: int | None, cols: int | None):
@@ -531,9 +540,34 @@ def main():
         if not (0 <= index < len(tiles)):
             return
         update_tile_offsets()
+        # Prefer videos that are not currently in use and differ from the tile being
+        # replaced so we don't appear to "reroll" to the same clip repeatedly.
         active_paths = {t.path for j, t in enumerate(tiles) if j != index}
-        candidates = [p for p in pool if p not in active_paths]
-        new_path = random.choice(candidates) if candidates else random.choice(pool)
+        current_path = tiles[index].path
+
+        def choose(candidates: list[Path]) -> Path | None:
+            if candidates:
+                return random.choice(candidates)
+            return None
+
+        new_path = None
+        # First try videos not shown anywhere and different from the current tile.
+        new_path = choose(
+            [
+                p
+                for p in pool
+                if p not in active_paths and p != current_path
+            ]
+        )
+        if new_path is None:
+            # Next allow reusing the current tile's path if it's the only unused option.
+            new_path = choose([p for p in pool if p not in active_paths])
+        if new_path is None:
+            # Finally fall back to any different video, even if it's active elsewhere.
+            new_path = choose([p for p in pool if p != current_path])
+        if new_path is None:
+            # Worst case: only option is to keep the same video.
+            new_path = current_path
         tiles[index] = TileState(
             path=new_path,
             seek=random_seek(
@@ -564,7 +598,9 @@ def main():
 
     # POSIX raw key reading
     try:
-        import termios, tty, select
+        import select
+        import termios
+        import tty
 
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
