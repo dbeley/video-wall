@@ -20,6 +20,8 @@ DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 class VideoMeta:
     duration: float | None
     has_audio: bool
+    has_video: bool
+    video_codec: str | None
 
 
 _metadata_cache: dict[Path, VideoMeta] = {}
@@ -53,16 +55,14 @@ def get_metadata(path: Path) -> VideoMeta:
     if meta is not None:
         return meta
 
+    # Query all streams + format once; parse audio/video presence and duration
     out = run_cmd(
         [
             "ffprobe",
             "-v",
             "error",
-            "-select_streams",
-            "a",
-            # Use colon to separate sections: format=...:stream=...
             "-show_entries",
-            "format=duration:stream=index",
+            "format=duration:stream=index,codec_type,codec_name",
             "-of",
             "json",
             str(path),
@@ -71,6 +71,7 @@ def get_metadata(path: Path) -> VideoMeta:
 
     duration: float | None = None
     has_audio = False
+    has_video = False
     if out:
         try:
             data = json.loads(out)
@@ -79,16 +80,37 @@ def get_metadata(path: Path) -> VideoMeta:
             if dur_str:
                 duration = float(dur_str)
             streams = data.get("streams") or []
-            has_audio = len(streams) > 0
+            vcodec: str | None = None
+            for s in streams:
+                ctype = (s.get("codec_type") or "").lower()
+                if ctype == "audio":
+                    has_audio = True
+                if ctype == "video":
+                    has_video = True
+                    if vcodec is None:
+                        name = s.get("codec_name")
+                        if isinstance(name, str) and name:
+                            vcodec = name.lower()
         except Exception as exc:  # pragma: no cover - fallback for malformed output
             print(
                 f"[warn] failed to parse ffprobe output for {path}: {exc}",
                 file=sys.stderr,
             )
 
-    meta = VideoMeta(duration=duration, has_audio=has_audio)
+    # best effort: if we didn't see a video stream, codec stays None
+    meta = VideoMeta(
+        duration=duration, has_audio=has_audio, has_video=has_video, video_codec=locals().get("vcodec")
+    )
     _metadata_cache[path] = meta
     return meta
+
+
+def is_valid_video(path: Path) -> bool:
+    """Cheap, cached validity check: returns True if ffprobe sees a video stream."""
+    try:
+        return get_metadata(path).has_video
+    except Exception:
+        return False
 
 
 def normalize_seek(path: Path, offset: float, loop: bool) -> float:
@@ -235,27 +257,36 @@ def build_ffmpeg_cmd(
     if filter_threads and filter_threads > 0:
         args += ["-filter_threads", str(filter_threads)]
 
-    # Per-input: hwaccel + seek + input
+    # Per-input: hwaccel + seek + input (decide per tile based on codec)
+    per_input_hw: list[str | None] = []
     for tile in tiles:
         path = tile.path
+        meta = tile.metadata
+        # Avoid forcing hwaccel for codecs known to be problematic (e.g., mpeg4)
+        codec = (meta.video_codec or "").lower()
+        wants_hw = hwaccel_mode in {"cuda", "vaapi"} and codec not in {"mpeg4", "msmpeg4v3", "mpeg1video"}
+
         if loop:
             args += ["-stream_loop", "-1"]
-        if hwaccel_mode == "cuda":
+        if wants_hw and hwaccel_mode == "cuda":
+            per_input_hw.append("cuda")
             args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        elif hwaccel_mode == "vaapi":
+        elif wants_hw and hwaccel_mode == "vaapi":
+            per_input_hw.append("vaapi")
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        # else: software decode
+        else:
+            per_input_hw.append(None)
         args += ["-ss", f"{tile.seek:.3f}", "-i", str(path.resolve())]
 
     # Build filter graph
     flt, vouts, with_audio = [], [], []
     for i, tile in enumerate(tiles):
         ops: list[str] = []
-        if hwaccel_mode == "cuda":
+        if per_input_hw[i] == "cuda":
             ops.append(f"scale_cuda={cw}:{ch}:force_original_aspect_ratio=decrease")
             ops.append("hwdownload")
             ops.append("format=nv12")
-        elif hwaccel_mode == "vaapi":
+        elif per_input_hw[i] == "vaapi":
             ops.append(
                 f"scale_vaapi=w={cw}:h={ch}:force_original_aspect_ratio=decrease"
             )
@@ -479,7 +510,35 @@ def main():
     pool = collect_videos(args.folder, exts, args.recursive)
     if len(pool) < args.count:
         raise SystemExit(f"Need at least {args.count} videos with extensions {exts}")
-    initial_paths = pick(pool, args.count)
+
+    # Only probe validity for the videos we actually attempt to use on the grid.
+    # Keep picking candidates until we have enough valid ones or we exhaust the pool.
+    def select_valid_paths(pool_paths: list[Path], needed: int) -> list[Path]:
+        if needed <= 0:
+            return []
+        candidates = list(pool_paths)
+        random.shuffle(candidates)
+        selected: list[Path] = []
+        tried = 0
+        for p in candidates:
+            tried += 1
+            if is_valid_video(p):
+                selected.append(p)
+                if len(selected) >= needed:
+                    break
+        if len(selected) < needed:
+            raise SystemExit(
+                f"Need at least {needed} valid videos with extensions {exts}"
+            )
+        if args.verbose:
+            print(
+                f"[info] initial select: {len(selected)}/{needed} valid "
+                f"after checking {tried}/{len(candidates)} candidates",
+                file=sys.stderr,
+            )
+        return selected
+
+    initial_paths = select_valid_paths(pool, args.count)
     tiles = [
         TileState(
             path=path,
@@ -574,9 +633,30 @@ def main():
         active_paths = {t.path for j, t in enumerate(tiles) if j != index}
         current_path = tiles[index].path
 
-        def choose(candidates: list[Path]) -> Path | None:
-            if candidates:
-                return random.choice(candidates)
+        def choose(candidates: list[Path], reason: str) -> Path | None:
+            # Prefer a random valid candidate; skip files that have no video stream.
+            if not candidates:
+                if args.verbose:
+                    print(f"[info] replace: {reason}: no candidates", file=sys.stderr)
+                return None
+            shuffled = list(candidates)
+            random.shuffle(shuffled)
+            tried = 0
+            for p in shuffled:
+                tried += 1
+                if is_valid_video(p):
+                    if args.verbose:
+                        print(
+                            f"[info] replace: {reason}: picked after "
+                            f"{tried}/{len(shuffled)} checked",
+                            file=sys.stderr,
+                        )
+                    return p
+            if args.verbose:
+                print(
+                    f"[info] replace: {reason}: no valid among {len(shuffled)} candidates",
+                    file=sys.stderr,
+                )
             return None
 
         new_path = None
@@ -586,16 +666,19 @@ def main():
                 p
                 for p in pool
                 if p not in active_paths and p != current_path
-            ]
+            ],
+            "unused+different",
         )
         if new_path is None:
             # Next allow reusing the current tile's path if it's the only unused option.
-            new_path = choose([p for p in pool if p not in active_paths])
+            new_path = choose([p for p in pool if p not in active_paths], "unused")
         if new_path is None:
             # Finally fall back to any different video, even if it's active elsewhere.
-            new_path = choose([p for p in pool if p != current_path])
+            new_path = choose([p for p in pool if p != current_path], "any different")
         if new_path is None:
             # Worst case: only option is to keep the same video.
+            if args.verbose:
+                print("[info] replace: fallback to current clip", file=sys.stderr)
             new_path = current_path
         tiles[index] = TileState(
             path=new_path,
@@ -637,7 +720,17 @@ def main():
 
         while True:
             if ffplay.poll() is not None or ffmpeg.poll() is not None:
+                # If the pipeline died very quickly, assume a bad input and swap one
+                ran_for = max(0.0, time.monotonic() - pipeline_start)
                 update_tile_offsets(finalizing=True)
+                if ran_for < 1.0:
+                    try:
+                        replace_tile(random.randrange(len(tiles)))
+                        # replace_tile() restarts the pipeline already
+                        continue
+                    except Exception:
+                        # Fallback to plain restart if replacement fails for any reason
+                        pass
                 restart_pipeline()
 
             dr, _, _ = select.select([sys.stdin], [], [], 0.1)
