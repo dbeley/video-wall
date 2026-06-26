@@ -399,8 +399,10 @@ def build_ffmpeg_cmd(
             args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif wants_hw and cfg.hwaccel.mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        # absolute() without resolve() to avoid symlink issues on NFS
-        args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path.absolute())]
+        # -i BEFORE -ss: sequential decode from start + dropping frames.
+        # Much gentler on NFS mounts than fast-seek which does random reads.
+        path_str = str(tile.path.absolute())
+        args += ["-i", path_str, "-ss", f"{tile.seek:.3f}"]
 
     flt, vouts, with_audio = _build_filter_graph(cfg)
 
@@ -690,7 +692,7 @@ class VideoWindow:
                 pass
             self.paused = False
 
-    def _replace_tile(self, index: int) -> None:
+    def _replace_tile(self, index: int, restart: bool = True) -> None:
         if not (0 <= index < len(self._tiles)):
             return
 
@@ -733,7 +735,8 @@ class VideoWindow:
             path=new_path,
             seek=random_seek(new_path, self._loop, self._start_pct, self._end_pct),
         )
-        self._restart_pipeline()
+        if restart:
+            self._restart_pipeline()
 
     def _seek_tile(self, index: int, delta: float) -> None:
         if not (0 <= index < len(self._tiles)):
@@ -750,6 +753,22 @@ class VideoWindow:
         """
         if self._make_cfg is None:
             return
+
+        # Pre-validate: ensure tile files are readable before starting ffmpeg
+        # (NFS workaround — catch stale handles / symlink issues early)
+        for i, tile in enumerate(self._tiles):
+            try:
+                with open(tile.path.absolute(), "rb") as fh:
+                    fh.read(1024)
+            except OSError as exc:
+                if self.verbose:
+                    print(
+                        f"[warn] tile {i} ({tile.path.name}) unreadable: "
+                        f"{exc} — picking replacement",
+                        file=sys.stderr,
+                    )
+                self._replace_tile(i, restart=False)
+
         cfg = self._make_cfg(self._tiles)
         want_audio = not cfg.no_audio
 
