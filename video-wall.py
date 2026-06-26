@@ -393,7 +393,7 @@ def build_ffmpeg_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
             args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif wants_hw and cfg.hwaccel.mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path.resolve())]
+        args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path)]
 
     flt, vouts, with_audio = _build_filter_graph(cfg)
 
@@ -462,7 +462,7 @@ def _build_audio_cmd(cfg: PipelineConfig) -> list[str] | None:
         "info" if cfg.verbose else "error",
     ]
     for t in cfg.tiles:
-        args += ["-ss", f"{t.seek:.3f}", "-i", str(t.path.resolve())]
+        args += ["-ss", f"{t.seek:.3f}", "-i", str(t.path)]
 
     flt_parts: list[str] = []
     for i in with_audio:
