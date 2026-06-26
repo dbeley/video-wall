@@ -428,18 +428,21 @@ def build_audio_cmd(cfg: PipelineConfig) -> list[str] | None:
         args += ["-ss", f"{t.seek:.3f}", "-i", str(t.path.absolute())]
 
     flt_parts: list[str] = []
-    for i in with_audio:
-        flt_parts.append(f"[{i}:a]volume={cfg.volume}[a{i}]")
-
+    # Connect audio streams directly to amix — no per-stream volume
+    # filter (which caused naming conflicts with multiple instances).
     if cfg.audio_mode == "one":
         chosen = with_audio[0] if cfg.audio_tile is None else cfg.audio_tile
         if chosen not in with_audio:
             chosen = with_audio[0]
-        flt_parts.append(f"[a{chosen}]aresample=async=1:min_hard_comp=0.100[A]")
+        flt_parts.append(
+            f"[{chosen}:a]aresample=async=1:min_hard_comp=0.100[A]"
+        )
     else:
         flt_parts.append(
-            f"{''.join(f'[a{i}]' for i in with_audio)}"
-            f"amix=inputs={len(with_audio)}:dropout_transition=200[Apre]"
+            f"{''.join(f'[{i}:a]' for i in with_audio)}"
+            f"amix=inputs={len(with_audio)}:"
+            f"dropout_transition=200:weights={cfg.volume}"  # per-input gain
+            f"[Apre]"
         )
         flt_parts.append("[Apre]aresample=async=1:min_hard_comp=0.100[A]")
 
@@ -575,6 +578,8 @@ class VideoWindow:
 
         Uses select with a 10ms timeout so we don't block event processing.
         Returns None if the pipe is dead, b"" if no data ready yet.
+        Loops internally to ensure a full frame is read (handles partial
+        reads from pipe after process resume).
         """
         if self._ffmpeg_vid is None or self._ffmpeg_vid.stdout is None:
             return None
@@ -587,10 +592,13 @@ class VideoWindow:
         if not r:
             return b""  # no data yet, not an error
 
-        raw = self._ffmpeg_vid.stdout.read(self.frame_size)
-        if len(raw) != self.frame_size:
-            return None
-        return raw
+        # Loop until we have a full frame (handles partial pipe reads)
+        raw = b""
+        while len(raw) < self.frame_size:
+            chunk = self._ffmpeg_vid.stdout.read(self.frame_size - len(raw))
+            if not chunk:  # EOF
+                return None
+            raw += chunk
 
     def _handle_key(self, key: int, mod: int):
         """Process a pygame KEYDOWN event."""
