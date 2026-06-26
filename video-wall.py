@@ -370,9 +370,8 @@ def build_ffmpeg_cmd(
     """
     Build ffmpeg command — single pipeline for video + audio.
 
-    - Reads inputs at real-time speed (-re) to pace frame output.
-    - Outputs raw RGB frames to stdout for the pygame viewer.
-    - If audio_fifo is set, also outputs mixed audio as WAV to that FIFO.
+    Pacing is handled by pipe buffering + the pygame viewer's clock,
+    so we do NOT use -re (which can cause EOF issues on NFS mounts).
     """
     n = len(cfg.tiles)
     args = [
@@ -396,13 +395,12 @@ def build_ffmpeg_cmd(
 
         if cfg.loop:
             args += ["-stream_loop", "-1"]
-        # -re: read input at native framerate → real-time decode → correct pace
-        args += ["-re"]
         if wants_hw and cfg.hwaccel.mode == "cuda":
             args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif wants_hw and cfg.hwaccel.mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path)]
+        # absolute() without resolve() to avoid symlink issues on NFS
+        args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path.absolute())]
 
     flt, vouts, with_audio = _build_filter_graph(cfg)
 
@@ -553,9 +551,16 @@ class VideoWindow:
         self._audio_fifo = None
 
     def _start_ffplay_audio(self) -> None:
-        """Start headless ffplay reading from the audio FIFO."""
+        """Start headless ffplay reading from the audio FIFO.
+
+        If ffplay is not available, audio is silently skipped.
+        """
         self._stop_ffplay_audio()
         if not self._audio_fifo or not os.path.exists(self._audio_fifo):
+            return
+        if not shutil.which("ffplay"):
+            if self.verbose:
+                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
             return
         self._ffplay_audio = subprocess.Popen(
             [
@@ -858,7 +863,6 @@ class VideoWindow:
 def main() -> None:
     need("ffmpeg")
     need("ffprobe")
-    need("ffplay")
 
     ap = argparse.ArgumentParser(
         description="Single-window video wall with pygame viewer.",
