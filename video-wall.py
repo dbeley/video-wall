@@ -521,6 +521,7 @@ class VideoWindow:
         # External state
         self._tiles: list[TileState] = []
         self._pool: list[Path] = []
+        self._banned: set[Path] = set()  # paths that caused crashes
         self._start_pct = 0.5
         self._end_pct = 0.75
         self._loop = False
@@ -667,9 +668,13 @@ class VideoWindow:
 
     # ----- Pipeline lifecycle -----
 
-    def _replace_tile(self, index: int, restart: bool = True) -> None:
+    def _replace_tile(self, index: int, restart: bool = True,
+                      ban: Path | None = None) -> None:
         if not (0 <= index < len(self._tiles)):
             return
+
+        if ban:
+            self._banned.add(ban)
 
         active_paths = {t.path for j, t in enumerate(self._tiles) if j != index}
         current_path = self._tiles[index].path
@@ -681,6 +686,8 @@ class VideoWindow:
             shuffled = list(candidates)
             random.shuffle(shuffled)
             for p in shuffled:
+                if p in self._banned:
+                    continue
                 if is_valid_video(p):
                     if self.verbose:
                         print(f"[info] replace: {label}: {p.name}", file=sys.stderr)
@@ -789,7 +796,8 @@ class VideoWindow:
                 if self._ffmpeg_vid is not None and self._ffmpeg_vid.poll() is not None:
                     if not self.paused:
                         try:
-                            self._replace_tile(random.randrange(len(self._tiles)))
+                            idx = random.randrange(len(self._tiles))
+                            self._replace_tile(idx, ban=self._tiles[idx].path)
                             continue
                         except Exception:
                             pass
@@ -799,7 +807,8 @@ class VideoWindow:
 
                 if frame_data is None:
                     if not self.paused and self._ffmpeg_vid is not None:
-                        self._restart_pipeline()
+                        idx = random.randrange(len(self._tiles))
+                        self._replace_tile(idx, ban=self._tiles[idx].path)
                     continue
 
                 if frame_data == b"":
