@@ -417,14 +417,14 @@ def build_ffmpeg_cmd(
             if chosen is None:
                 chosen = with_audio[0]
             flt.append(f"[a{chosen}]aresample=async=1:min_hard_comp=0.100[A]")
-            maps += ["-map", "[A]"]
         else:
             flt.append(
                 f"{''.join(f'[a{i}]' for i in with_audio)}"
                 f"amix=inputs={len(with_audio)}:dropout_transition=200[Apre]"
             )
             flt.append("[Apre]aresample=async=1:min_hard_comp=0.100[A]")
-            maps += ["-map", "[A]"]
+        # [A] is NOT mapped globally; it's mapped only in the FIFO audio
+        # output section below, so it doesn't pollute the stdout pipe.
 
     total_w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
     total_h = cfg.rows * (cfg.cell_h + cfg.border) - cfg.border
