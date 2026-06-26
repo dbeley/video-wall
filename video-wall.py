@@ -358,8 +358,14 @@ def _build_filter_graph(
         row = i // cfg.cols
         layout_parts.append(f"{col * stride_w}_{row * stride_h}")
 
+    # fps filter at the end of video chain: pace output to VIDEO_FPS.
+    # Without this, ffmpeg decodes faster than real-time and the
+    # pygame viewer displays frames at decode speed (sped-up video).
     layout = "|".join(layout_parts)
-    flt.append(f"{''.join(vouts)}xstack=inputs={n}:layout={layout}[V]")
+    flt.append(
+        f"{''.join(vouts)}xstack=inputs={n}:layout={layout},"
+        f"fps={VIDEO_FPS}[V]"
+    )
 
     return flt, vouts, with_audio
 
@@ -446,6 +452,8 @@ def build_ffmpeg_cmd(
     ]
 
     # ---- Audio output to FIFO (only when needed) ----
+    # Use raw PCM (s16le) instead of WAV — WAV requires seeking to
+    # write the header, which fails on a named FIFO.
     if want_audio and audio_fifo:
         args += [
             "-map",
@@ -455,7 +463,7 @@ def build_ffmpeg_cmd(
             "-ar",
             str(cfg.audio_rate),
             "-f",
-            "wav",
+            "s16le",
             audio_fifo,
         ]
 
@@ -521,6 +529,7 @@ class VideoWindow:
         self._ffmpeg: subprocess.Popen | None = None
         self._ffplay_audio: subprocess.Popen | None = None
         self._audio_fifo: str | None = None
+        self._audio_rate: int = 48000
         self._pending_seek: float | None = None
         self._clock = pygame.time.Clock()
 
@@ -573,6 +582,12 @@ class VideoWindow:
                 "-loglevel",
                 "info" if self.verbose else "error",
                 "-autoexit",
+                "-f",
+                "s16le",
+                "-ac",
+                "2",
+                "-ar",
+                str(self._audio_rate),
                 "-i",
                 self._audio_fifo,
             ],
@@ -771,6 +786,7 @@ class VideoWindow:
                 self._replace_tile(i, restart=False)
 
         cfg = self._make_cfg(self._tiles)
+        self._audio_rate = cfg.audio_rate
         want_audio = not cfg.no_audio
 
         # Create/recreate the audio FIFO before building the command
@@ -970,9 +986,10 @@ def main() -> None:
     # HW accel
     ap.add_argument(
         "--hwaccel",
-        default="auto",
+        default="off",
         choices=["auto", "off", "cuda", "vaapi"],
-        help="HW decode: auto-detect, off, cuda, or vaapi (default: auto)",
+        help="HW decode: off (default), auto, cuda, or vaapi. "
+        "VAAPI/CUDA auto-detection is unreliable across codecs",
     )
 
     args = ap.parse_args()
