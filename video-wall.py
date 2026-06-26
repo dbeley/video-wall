@@ -399,10 +399,11 @@ def build_ffmpeg_cmd(
             args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         elif wants_hw and cfg.hwaccel.mode == "vaapi":
             args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        # -i BEFORE -ss: sequential decode from start + dropping frames.
-        # Much gentler on NFS mounts than fast-seek which does random reads.
+        # -ss BEFORE -i: fast seek (keyframe-based).
+        # Compatible with VAAPI/CUDA HW decoders. Sequential decode
+        # (-ss after -i) breaks with hardware acceleration.
         path_str = str(tile.path.absolute())
-        args += ["-i", path_str, "-ss", f"{tile.seek:.3f}"]
+        args += ["-ss", f"{tile.seek:.3f}", "-i", path_str]
 
     flt, vouts, with_audio = _build_filter_graph(cfg)
 
