@@ -306,7 +306,7 @@ def choose_hwaccel(pref: str | None = None) -> HwAccelConfig:
 
 
 def _build_filter_graph(
-    cfg: PipelineConfig,
+    cfg: PipelineConfig, include_audio: bool = True
 ) -> tuple[list[str], list[str], list[int]]:
     n = len(cfg.tiles)
     flt: list[str] = []
@@ -347,7 +347,7 @@ def _build_filter_graph(
         vouts.append(f"[v{i}]")
         flt.append(f"[{i}:v]{','.join(ops)}[v{i}]")
 
-        if not cfg.no_audio and meta.has_audio:
+        if include_audio and not cfg.no_audio and meta.has_audio:
             with_audio.append(i)
             flt.append(f"[{i}:a]volume={cfg.volume}[a{i}]")
 
@@ -396,7 +396,7 @@ def build_video_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
         path_str = str(tile.path.absolute())
         args += ["-ss", f"{tile.seek:.3f}", "-i", path_str]
 
-    flt, vouts, _with_audio = _build_filter_graph(cfg)
+    flt, vouts, _with_audio = _build_filter_graph(cfg, include_audio=False)
     # Video only — no audio mapping in this pipeline
     maps = ["-map", "[V]"]
 
