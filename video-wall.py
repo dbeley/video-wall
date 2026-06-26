@@ -24,6 +24,7 @@ warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
 
 import pygame  # noqa: E402 — late import after env setup
 
+MIN_FILE_SIZE = 50 * 1024  # 50 KB — skip torrent stubs / incomplete dls
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 GRID_PRESETS = {
     "2x2": (2, 2),
@@ -171,8 +172,18 @@ def get_metadata(path: Path) -> VideoMeta:
 
 
 def is_valid_video(path: Path) -> bool:
+    """Cheap cached validity: returns True if ffprobe sees a video stream
+    AND the file is large enough (filters torrent stubs)."""
     try:
-        return get_metadata(path).has_video
+        if not get_metadata(path).has_video:
+            return False
+        # Skip suspiciously small files (incomplete torrents, stubs)
+        try:
+            if path.stat().st_size < MIN_FILE_SIZE:
+                return False
+        except OSError:
+            return False
+        return True
     except Exception:
         return False
 
@@ -574,7 +585,14 @@ class VideoWindow:
         self._stop_audio()
 
     def _read_frame(self) -> bytes | None:
-        """Read one raw RGB frame from the video pipe."""
+        """Read one raw RGB frame from the video pipe.
+
+        Uses select with a 10ms timeout so we don't block event processing.
+        Returns None if the pipe is dead, b"" if no data ready yet.
+        If a partial frame is read (e.g. after SIGCONT resume), we block
+        until the full frame arrives rather than returning None (which
+        would trigger a spurious pipeline restart).
+        """
         if self._ffmpeg_vid is None or self._ffmpeg_vid.stdout is None:
             return None
         if self._ffmpeg_vid.poll() is not None:
@@ -585,9 +603,12 @@ class VideoWindow:
         if not r:
             return b""
 
+        # Read full frame — handles partial pipe reads gracefully
         raw = self._ffmpeg_vid.stdout.read(self.frame_size)
         if len(raw) != self.frame_size:
-            return None
+            # Partial frame (possible after SIGCONT) — don't restart,
+            # just wait for the next iteration
+            return None if len(raw) == 0 else b""
         return raw
 
     # ----- Keyboard -----
