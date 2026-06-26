@@ -602,9 +602,15 @@ class VideoWindow:
         """Kill old ffmpeg, start new one, and (re)start audio ffplay.
 
         The audio FIFO must already exist (created by _restart_pipeline).
+        IMPORTANT: ffplay is started BEFORE ffmpeg so the FIFO already
+        has a reader when ffmpeg opens it for writing — otherwise ffmpeg
+        hangs on open() waiting for a reader.
         """
         kill_proc(self._ffmpeg)
         self._ffmpeg = None
+
+        if want_audio:
+            self._start_ffplay_audio()
 
         # Stderr: show if verbose, hide otherwise
         self._ffmpeg = subprocess.Popen(
@@ -612,9 +618,6 @@ class VideoWindow:
             stdout=subprocess.PIPE,
             stderr=None if self.verbose else subprocess.DEVNULL,
         )
-
-        if want_audio:
-            self._start_ffplay_audio()
 
     def _stop_procs(self) -> None:
         kill_proc(self._ffmpeg)
