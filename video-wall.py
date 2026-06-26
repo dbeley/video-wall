@@ -584,7 +584,7 @@ class VideoWindow:
                 "-autoexit",
                 "-f",
                 "s16le",
-                "-ac",
+                "-channels",
                 "2",
                 "-ar",
                 str(self._audio_rate),
@@ -635,7 +635,7 @@ class VideoWindow:
             return None
 
         fd = self._ffmpeg.stdout.fileno()
-        r, _, _ = select.select([fd], [], [], 0.05)
+        r, _, _ = select.select([fd], [], [], 0.01)
         if not r:
             return b""  # no data yet, not an error
 
@@ -871,14 +871,14 @@ class VideoWindow:
                     continue
 
                 if frame_data == b"":
-                    self._clock.tick(60)
+                    self._clock.tick(VIDEO_FPS)
                     continue
 
                 surface = pygame.image.frombuffer(
                     frame_data, (self.width, self.height), "RGB"
                 )
 
-                # In fullscreen mode, scale the surface to fill the screen
+                # In fullscreen mode, scale to fill screen
                 win_w, win_h = self.screen.get_size()
                 if win_w != self.width or win_h != self.height:
                     surface = pygame.transform.scale(surface, (win_w, win_h))
@@ -886,7 +886,7 @@ class VideoWindow:
                 self.screen.blit(surface, (0, 0))
                 pygame.display.flip()
 
-                self._clock.tick(60)
+                self._clock.tick(VIDEO_FPS)
         finally:
             self._stop_procs()
             pygame.display.quit()
