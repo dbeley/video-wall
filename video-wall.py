@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""video-wall — Single-window video wall with pygame viewer."""
+"""video-wall — Single-window video wall with pygame viewer (video only)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from pathlib import Path
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
 
-import pygame  # noqa: E402 — intentional late import
+import pygame  # noqa: E402 — intentional late import after env setup
 
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 GRID_PRESETS = {
@@ -68,13 +68,8 @@ class PipelineConfig:
     cell_w: int
     cell_h: int
     loop: bool
-    volume: float
     hwaccel: HwAccelConfig
     verbose: bool
-    no_audio: bool
-    audio_mode: str
-    audio_tile: int | None
-    audio_rate: int
     border: int
     fullscreen: bool
 
@@ -302,22 +297,20 @@ def choose_hwaccel(pref: str | None = None) -> HwAccelConfig:
     return HwAccelConfig()
 
 
-# -------- ffmpeg command builder (video only) --------
+# -------- ffmpeg command builder --------
 
 
 def _build_filter_graph(
-    cfg: PipelineConfig, include_audio: bool = True
-) -> tuple[list[str], list[str], list[int]]:
-    n = len(cfg.tiles)
+    cfg: PipelineConfig,
+) -> tuple[list[str], list[str]]:
+    """Build filter graph for the video xstack wall. Video only — no audio."""
     flt: list[str] = []
     vouts: list[str] = []
-    with_audio: list[int] = []
 
     stride_w = cfg.cell_w + cfg.border
     stride_h = cfg.cell_h + cfg.border
 
     for i, tile in enumerate(cfg.tiles):
-        meta = tile.metadata
         ops: list[str] = []
 
         hw = cfg.hwaccel.mode
@@ -347,27 +340,23 @@ def _build_filter_graph(
         vouts.append(f"[v{i}]")
         flt.append(f"[{i}:v]{','.join(ops)}[v{i}]")
 
-        if include_audio and not cfg.no_audio and meta.has_audio:
-            with_audio.append(i)
-            flt.append(f"[{i}:a]volume={cfg.volume}[a{i}]")
-
     layout_parts: list[str] = []
-    for i in range(n):
+    for i in range(len(cfg.tiles)):
         col = i % cfg.cols
         row = i // cfg.cols
         layout_parts.append(f"{col * stride_w}_{row * stride_h}")
 
     layout = "|".join(layout_parts)
     flt.append(
-        f"{''.join(vouts)}xstack=inputs={n}:layout={layout},"
+        f"{''.join(vouts)}xstack=inputs={len(cfg.tiles)}:layout={layout},"
         f"fps={VIDEO_FPS}[V]"
     )
 
-    return flt, vouts, with_audio
+    return flt, vouts
 
 
 def build_video_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
-    """Build ffmpeg command that outputs raw RGB frames to stdout (video only)."""
+    """Build ffmpeg command — raw RGB frames to stdout, video only."""
     args = [
         "ffmpeg",
         "-hide_banner",
@@ -396,8 +385,7 @@ def build_video_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
         path_str = str(tile.path.absolute())
         args += ["-ss", f"{tile.seek:.3f}", "-i", path_str]
 
-    flt, vouts, _with_audio = _build_filter_graph(cfg, include_audio=False)
-    # Video only — no audio mapping in this pipeline
+    flt, vouts = _build_filter_graph(cfg)
     maps = ["-map", "[V]"]
 
     total_w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
@@ -410,46 +398,6 @@ def build_video_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
         "-f", "image2pipe", "-",
     ]
     return args, total_w, total_h
-
-
-def build_audio_cmd(cfg: PipelineConfig) -> list[str] | None:
-    """Build a separate ffmpeg command for audio only, outputting PCM to stdout."""
-    with_audio = [i for i, t in enumerate(cfg.tiles) if t.metadata.has_audio]
-    if not with_audio:
-        return None
-
-    args = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "info" if cfg.verbose else "error",
-    ]
-    for t in cfg.tiles:
-        args += ["-ss", f"{t.seek:.3f}", "-i", str(t.path.absolute())]
-
-    flt_parts: list[str] = []
-    # Connect audio streams directly to amix — no per-stream volume
-    # filter (which caused naming conflicts with multiple instances).
-    if cfg.audio_mode == "one":
-        chosen = with_audio[0] if cfg.audio_tile is None else cfg.audio_tile
-        if chosen not in with_audio:
-            chosen = with_audio[0]
-        flt_parts.append(
-            f"[{chosen}:a]aresample=async=1:min_hard_comp=0.100[A]"
-        )
-    else:
-        flt_parts.append(
-            f"{''.join(f'[{i}:a]' for i in with_audio)}"
-            f"amix=inputs={len(with_audio)}:"
-            f"dropout_transition=200:weights={cfg.volume}"  # per-input gain
-            f"[Apre]"
-        )
-        flt_parts.append("[Apre]aresample=async=1:min_hard_comp=0.100[A]")
-
-    args += ["-filter_complex", ";".join(flt_parts)]
-    args += ["-map", "[A]", "-c:a", "pcm_s16le", "-ar", str(cfg.audio_rate)]
-    args += ["-f", "wav", "-"]
-    return args
 
 
 # -------- Kill helper --------
@@ -475,15 +423,10 @@ def kill_proc(p: subprocess.Popen | None) -> None:
 
 
 class VideoWindow:
-    """Pygame window displaying raw RGB frames from an ffmpeg pipe.
+    """Pygame window displaying raw RGB frames from an ffmpeg pipe (video only).
 
-    Two independent ffmpeg instances:
-      - Video: ffmpeg → rawvideo pipe → pygame (reads & displays frames)
-      - Audio: ffmpeg → PCM pipe → ffplay -nodisp (headless playback)
-
-    Each is restarted independently when tiles change.
-    The window stays open across restarts.
-    Keyboard events from the pygame window (not terminal).
+    The window stays open across tile replacements (only ffmpeg restarts).
+    Keyboard events from the pygame window (not terminal) control playback.
     """
 
     def __init__(
@@ -509,9 +452,7 @@ class VideoWindow:
         self.running = False
         self.paused = False
 
-        self._ffmpeg_vid: subprocess.Popen | None = None
-        self._ffmpeg_aud: subprocess.Popen | None = None
-        self._ffplay_aud: subprocess.Popen | None = None
+        self._ffmpeg: subprocess.Popen | None = None
         self._pending_seek: float | None = None
         self._clock = pygame.time.Clock()
 
@@ -521,84 +462,42 @@ class VideoWindow:
         self._start_pct = 0.5
         self._end_pct = 0.75
         self._loop = False
-        self._cfg_no_audio = False
         self._make_cfg = None
 
-    def _start_audio(self, cmd: list[str] | None) -> None:
-        """Start/replace the audio pipeline (ffmpeg → ffplay -nodisp)."""
-        kill_proc(self._ffmpeg_aud)
-        kill_proc(self._ffplay_aud)
-        self._ffmpeg_aud = None
-        self._ffplay_aud = None
-
-        if not cmd:
-            return
-        if not shutil.which("ffplay"):
-            if self.verbose:
-                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
-            return
-
-        self._ffplay_aud = subprocess.Popen(
-            [
-                "ffplay",
-                "-nodisp", "-vn",
-                "-loglevel", "info" if self.verbose else "error",
-                "-autoexit",
-                "-i", "pipe:0",
-            ],
-            stdin=subprocess.PIPE,
-        )
-        self._ffmpeg_aud = subprocess.Popen(cmd, stdout=self._ffplay_aud.stdin)
-
-    def _stop_audio(self) -> None:
-        kill_proc(self._ffmpeg_aud)
-        kill_proc(self._ffplay_aud)
-        self._ffmpeg_aud = None
-        self._ffplay_aud = None
-
-    def _start_video(self, cmd: list[str]) -> None:
-        """Start/replace the video ffmpeg pipeline."""
-        kill_proc(self._ffmpeg_vid)
-        self._ffmpeg_vid = subprocess.Popen(
+    def start_video(self, cmd: list[str]) -> None:
+        """Start/replace the video ffmpeg subprocess."""
+        kill_proc(self._ffmpeg)
+        self._ffmpeg = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=None if self.verbose else subprocess.DEVNULL,
         )
 
-    def _stop_video(self) -> None:
-        kill_proc(self._ffmpeg_vid)
-        self._ffmpeg_vid = None
-
     def _stop_procs(self) -> None:
-        self._stop_video()
-        self._stop_audio()
+        kill_proc(self._ffmpeg)
+        self._ffmpeg = None
 
     def _read_frame(self) -> bytes | None:
-        """Read one raw RGB frame from the video pipe.
+        """Read one raw RGB frame from the pipe.
 
         Uses select with a 10ms timeout so we don't block event processing.
         Returns None if the pipe is dead, b"" if no data ready yet.
-        Loops internally to ensure a full frame is read (handles partial
-        reads from pipe after process resume).
         """
-        if self._ffmpeg_vid is None or self._ffmpeg_vid.stdout is None:
+        if self._ffmpeg is None or self._ffmpeg.stdout is None:
             return None
 
-        if self._ffmpeg_vid.poll() is not None:
+        if self._ffmpeg.poll() is not None:
             return None
 
-        fd = self._ffmpeg_vid.stdout.fileno()
+        fd = self._ffmpeg.stdout.fileno()
         r, _, _ = select.select([fd], [], [], 0.01)
         if not r:
             return b""  # no data yet, not an error
 
-        # Loop until we have a full frame (handles partial pipe reads)
-        raw = b""
-        while len(raw) < self.frame_size:
-            chunk = self._ffmpeg_vid.stdout.read(self.frame_size - len(raw))
-            if not chunk:  # EOF
-                return None
-            raw += chunk
+        raw = self._ffmpeg.stdout.read(self.frame_size)
+        if len(raw) != self.frame_size:
+            return None
+        return raw
 
     def _handle_key(self, key: int, mod: int):
         """Process a pygame KEYDOWN event."""
@@ -614,7 +513,6 @@ class VideoWindow:
             self._replace_tile(random.randrange(len(self._tiles)))
             return
 
-        # Seek forward / backward
         if key == pygame.K_f:
             self._pending_seek = 30.0 if (mod & pygame.KMOD_SHIFT) else 10.0
             return
@@ -622,7 +520,6 @@ class VideoWindow:
             self._pending_seek = -30.0 if (mod & pygame.KMOD_SHIFT) else -10.0
             return
 
-        # Tile number
         idx = self._key_to_tile(key)
         if idx is not None and idx < len(self._tiles):
             if self._pending_seek is not None:
@@ -643,20 +540,16 @@ class VideoWindow:
 
     def _toggle_pause(self) -> None:
         if not self.paused:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud, self._ffplay_aud):
-                if p is not None:
-                    try:
-                        os.kill(p.pid, signal.SIGSTOP)
-                    except Exception:
-                        pass
+            try:
+                os.kill(self._ffmpeg.pid, signal.SIGSTOP)
+            except Exception:
+                pass
             self.paused = True
         else:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud, self._ffplay_aud):
-                if p is not None:
-                    try:
-                        os.kill(p.pid, signal.SIGCONT)
-                    except Exception:
-                        pass
+            try:
+                os.kill(self._ffmpeg.pid, signal.SIGCONT)
+            except Exception:
+                pass
             self.paused = False
 
     def _replace_tile(self, index: int, restart: bool = True) -> None:
@@ -713,16 +606,12 @@ class VideoWindow:
         self._restart_pipeline()
 
     def _restart_pipeline(self) -> None:
-        """Kill all processes and restart video + audio pipelines."""
+        """Kill ffmpeg and start a new one — the pygame window stays open."""
         if self._make_cfg is None:
             return
 
         cfg = self._make_cfg(self._tiles)
-        want_audio = not cfg.no_audio
-
-        # Build commands
         vid_cmd, w, h = build_video_cmd(cfg)
-        aud_cmd = build_audio_cmd(cfg) if want_audio else None
 
         if (w, h) != (self.width, self.height):
             self.width = w
@@ -731,14 +620,7 @@ class VideoWindow:
             flags = self.screen.get_flags()
             self.screen = pygame.display.set_mode((w, h), flags)
 
-        # Stop old, start new — video first, then audio
-        kill_proc(self._ffmpeg_vid)
-        self._ffmpeg_vid = subprocess.Popen(
-            vid_cmd,
-            stdout=subprocess.PIPE,
-            stderr=None if self.verbose else subprocess.DEVNULL,
-        )
-        self._start_audio(aud_cmd)
+        self.start_video(vid_cmd)
 
     def run(
         self,
@@ -773,7 +655,6 @@ class VideoWindow:
 
         try:
             while self.running:
-                # ---- Process pygame events ----
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         self.running = False
@@ -784,8 +665,8 @@ class VideoWindow:
                 if not self.running:
                     break
 
-                # ---- Check if video ffmpeg died unexpectedly ----
-                if self._ffmpeg_vid is not None and self._ffmpeg_vid.poll() is not None:
+                # If ffmpeg died unexpectedly, restart (with auto tile replace)
+                if self._ffmpeg is not None and self._ffmpeg.poll() is not None:
                     if not self.paused:
                         try:
                             self._replace_tile(random.randrange(len(self._tiles)))
@@ -794,11 +675,10 @@ class VideoWindow:
                             pass
                     self._restart_pipeline()
 
-                # ---- Read and display frame ----
                 frame_data = self._read_frame()
 
                 if frame_data is None:
-                    if not self.paused and self._ffmpeg_vid is not None:
+                    if not self.paused and self._ffmpeg is not None:
                         self._restart_pipeline()
                     continue
 
@@ -810,7 +690,6 @@ class VideoWindow:
                     frame_data, (self.width, self.height), "RGB"
                 )
 
-                # In fullscreen mode, scale to fill screen
                 win_w, win_h = self.screen.get_size()
                 if win_w != self.width or win_h != self.height:
                     surface = pygame.transform.scale(surface, (win_w, win_h))
@@ -842,7 +721,8 @@ def main() -> None:
             "  1-9, a-f    = replace specific tile (0=last, a=10..f=15)\n"
             "  f/F + tile  = seek forward 10s/30s\n"
             "  b/B + tile  = seek backward 10s/30s\n"
-            "  q           = quit"
+            "  q           = quit\n\n"
+            "Note: audio output not yet supported in this version.\n"
         ),
     )
     ap.add_argument("folder", type=Path, help="Folder with videos")
@@ -857,7 +737,6 @@ def main() -> None:
     ap.add_argument("--cell-width", type=int, default=480, help="Tile width in px")
     ap.add_argument("--cell-height", type=int, default=270, help="Tile height in px")
     ap.add_argument("--border", type=int, default=0, help="Black gap (px) between tiles")
-    ap.add_argument("--volume", type=float, default=0.5, help="Pre-mix gain per input")
     ap.add_argument("--loop", action="store_true", help="Loop each input")
     ap.add_argument(
         "--exts",
@@ -885,48 +764,19 @@ def main() -> None:
     )
     ap.add_argument("--seed", type=int, help="Random seed for deterministic runs")
     ap.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg logs")
-
-    # Audio
-    ap.add_argument("--no-audio", action="store_true", help="Disable audio")
-    ap.add_argument(
-        "--audio-mode",
-        choices=["mix", "one"],
-        default="mix",
-        help="Mix all audio or use only one tile's audio",
-    )
-    ap.add_argument(
-        "--audio-tile",
-        type=int,
-        default=0,
-        metavar="TILE",
-        help="Tile index (0-based) for --audio-mode=one (default: 0)",
-    )
-    ap.add_argument(
-        "--audio-rate",
-        type=int,
-        default=48000,
-        metavar="HZ",
-        help="Sample rate in Hz (default: 48000)",
-    )
-
-    # Display
     ap.add_argument(
         "--fullscreen", "-f", action="store_true",
         help="Fullscreen mode",
     )
-
-    # HW accel
     ap.add_argument(
         "--hwaccel",
         default="off",
         choices=["auto", "off", "cuda", "vaapi"],
-        help="HW decode: off (default), auto, cuda, or vaapi. "
-        "VAAPI/CUDA auto-detection is unreliable across codecs",
+        help="HW decode: off (default), auto, cuda, or vaapi",
     )
 
     args = ap.parse_args()
 
-    # ---- Validate ----
     if args.preset:
         args.rows, args.cols = GRID_PRESETS[args.preset]
 
@@ -938,7 +788,6 @@ def main() -> None:
     exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
     recursive = not args.no_recursive
 
-    # ---- Collect files ----
     def _collect_videos(
         root: Path, extensions: tuple[str, ...], rec: bool
     ) -> list[Path]:
@@ -961,7 +810,6 @@ def main() -> None:
             f"found {len(pool)} in {args.folder}."
         )
 
-    # ---- Select tiles ----
     initial_paths = pick_videos(pool, args.count, exts, args.seed)
     tiles: list[TileState] = [
         TileState(
@@ -972,7 +820,6 @@ def main() -> None:
     ]
     rows, cols = compute_grid(args.count, args.rows, args.cols)
 
-    # HW accel
     hw_cfg = choose_hwaccel(args.hwaccel)
     if args.verbose:
         print(f"[info] HW accel: {hw_cfg.mode or 'software'}", file=sys.stderr)
@@ -986,7 +833,6 @@ def main() -> None:
     total_w = cols * (args.cell_width + args.border) - args.border
     total_h = rows * (args.cell_height + args.border) - args.border
 
-    # ---- Make pipeline config factory ----
     def make_cfg(cur_tiles: list[TileState]) -> PipelineConfig:
         return PipelineConfig(
             tiles=cur_tiles,
@@ -995,18 +841,12 @@ def main() -> None:
             cell_w=args.cell_width,
             cell_h=args.cell_height,
             loop=args.loop,
-            volume=args.volume,
             hwaccel=hw_cfg,
             verbose=args.verbose,
-            no_audio=args.no_audio,
-            audio_mode=args.audio_mode,
-            audio_tile=args.audio_tile,
-            audio_rate=args.audio_rate,
             border=args.border,
             fullscreen=args.fullscreen,
         )
 
-    # ---- Launch viewer ----
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         raise SystemExit(
             "No display detected (DISPLAY/WAYLAND_DISPLAY not set).\n"
