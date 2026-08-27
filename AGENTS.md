@@ -16,7 +16,7 @@
 Runtime dependencies: `ffmpeg`, `ffprobe` in `PATH`. `ffplay` needed only for audio.
 
 ## Current Feature Set (CLI)
-- Grid layout with `--count` 1–16; optional `--rows/--cols` or `--preset`.
+- Grid layout with `--count` 1–16; optional `--grid NxM` (e.g. `--grid 3x3`).
 - Cell sizing via `--cell-width/--cell-height`; auto total size from grid.
 - Always rawvideo+pcm pipe to pygame viewer (no H.264 encode overhead).
 - `--border` adds black gaps between tiles.
@@ -24,7 +24,7 @@ Runtime dependencies: `ffmpeg`, `ffprobe` in `PATH`. `ffplay` needed only for au
 - Audio control: `--no-audio`, `--audio-mode {mix,one}`, `--audio-tile`, `--audio-rate`.
   Audio played via separate headless ffplay (`-nodisp -vn`).
 - Hardware decode `--hwaccel {off,auto,cuda,vaapi}` with runtime CUDA lib check.
-- Input selection: recursive by default (`--no-recursive` to limit to top-level).
+- Input selection: top-level only by default (`--recursive` to scan subdirectories).
 - Randomized start within `--start-pct/--end-pct` of duration.
 - Deterministic runs with `--seed`.
 - Verbose logging with `--verbose`.

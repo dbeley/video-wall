@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,15 +27,6 @@ import pygame  # noqa: E402 — late import after env setup
 
 MIN_FILE_SIZE = 50 * 1024  # 50 KB — skip torrent stubs / incomplete dls
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
-GRID_PRESETS = {
-    "2x2": (2, 2),
-    "3x2": (2, 3),
-    "2x3": (3, 2),
-    "3x3": (3, 3),
-    "4x3": (3, 4),
-    "3x4": (4, 3),
-    "4x4": (4, 4),
-}
 MAX_TILES = 16
 TITLE = "Video Wall"
 VIDEO_FPS = 30
@@ -221,29 +213,67 @@ def pick_videos(
 
     candidates = list(pool)
     random.shuffle(candidates)
+
+    def _validate(p: Path) -> tuple[Path, bool]:
+        return p, is_valid_video(p)
+
     selected: list[Path] = []
-    tried = 0
-    for p in candidates:
-        tried += 1
-        if is_valid_video(p):
-            selected.append(p)
-            if len(selected) >= count:
-                break
+    checked = 0
+    workers = min(8, len(candidates))
+    with ThreadPoolExecutor(max_workers=workers) as pool_exec:
+        futures = {
+            pool_exec.submit(_validate, p): p
+            for p in candidates[:min(len(candidates), count * 20)]
+        }
+        for fut in as_completed(futures):
+            p, ok = fut.result()
+            checked += 1
+            if checked % 5 == 0 or checked <= count:
+                print(
+                    f"\rValidating: {checked}/{len(futures)} checked, "
+                    f"{len(selected)}/{count} found",
+                    end="", file=sys.stderr, flush=True,
+                )
+            if ok:
+                selected.append(p)
+                if len(selected) >= count:
+                    pool_exec.shutdown(wait=False, cancel_futures=True)
+                    break
+
+    print(file=sys.stderr)  # newline after progress
+
     if len(selected) < count:
         raise SystemExit(
             f"Need at least {count} valid videos with extensions {exts}, "
-            f"only found {len(selected)}/{count} after checking {tried} candidates."
+            f"only found {len(selected)}/{count} after checking {checked} candidates."
         )
     return selected
 
 
-def compute_grid(n: int, rows: int | None, cols: int | None) -> tuple[int, int]:
-    if rows and cols:
-        return rows, cols
-    if not cols:
-        cols = math.ceil(math.sqrt(n))
-    if not rows:
-        rows = math.ceil(n / cols)
+def parse_grid(grid_str: str | None) -> tuple[int, int] | None:
+    """Parse 'NxM' grid string. Returns (rows, cols) or None."""
+    if not grid_str:
+        return None
+    parts = grid_str.lower().split("x")
+    if len(parts) != 2:
+        raise SystemExit(f"Invalid grid format '{grid_str}' — use NxM (e.g. 3x3, 2x4).")
+    try:
+        r, c = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise SystemExit(f"Invalid grid format '{grid_str}' — use NxM (e.g. 3x3, 2x4).")
+    if r < 1 or c < 1:
+        raise SystemExit("Grid rows and columns must be at least 1.")
+    if r * c > MAX_TILES:
+        raise SystemExit(f"Grid {r}x{c} = {r*c} tiles exceeds max {MAX_TILES}.")
+    return r, c
+
+
+def compute_grid(n: int, grid: tuple[int, int] | None) -> tuple[int, int]:
+    """Compute (rows, cols) for n tiles. If grid is given, use it explicitly."""
+    if grid:
+        return grid
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
     return rows, cols
 
 
@@ -857,12 +887,9 @@ def main() -> None:
 
     # Grid
     ap.add_argument("--count", "-n", type=int, default=4, help="Number of tiles (1–16)")
-    ap.add_argument("--rows", type=int, help="Override number of rows")
-    ap.add_argument("--cols", type=int, help="Override number of columns")
     ap.add_argument(
-        "--preset",
-        choices=list(GRID_PRESETS),
-        help="Grid preset (e.g. 3x3). Overrides --rows/--cols.",
+        "--grid", metavar="NxM",
+        help="Grid layout (e.g. 3x3, 2x4). Auto-computed from --count if omitted.",
     )
     ap.add_argument("--cell-width", type=int, default=480, help="Tile width in px")
     ap.add_argument("--cell-height", type=int, default=270, help="Tile height in px")
@@ -876,9 +903,9 @@ def main() -> None:
         help="Comma-separated extensions (default: %(default)s)",
     )
     ap.add_argument(
-        "--no-recursive",
+        "--recursive",
         action="store_true",
-        help="Only include top-level files (default: recursive)",
+        help="Recursively scan subdirectories for videos",
     )
     ap.add_argument(
         "--start-pct",
@@ -934,31 +961,34 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    if args.preset:
-        args.rows, args.cols = GRID_PRESETS[args.preset]
+    grid = parse_grid(args.grid)
 
     if args.count < 1 or args.count > MAX_TILES:
         raise SystemExit(f"--count must be between 1 and {MAX_TILES}.")
+    if grid and grid[0] * grid[1] < args.count:
+        raise SystemExit(
+            f"Grid {grid[0]}x{grid[1]} = {grid[0]*grid[1]} slots "
+            f"is smaller than --count {args.count}."
+        )
     if not args.folder.is_dir():
         raise SystemExit(f"{args.folder} is not a directory.")
 
     exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
-    recursive = not args.no_recursive
 
-    def _collect_videos(
-        root: Path, extensions: tuple[str, ...], rec: bool
-    ) -> list[Path]:
-        if rec:
-            return [
-                p for p in root.rglob("*")
-                if p.is_file() and p.suffix.lower() in extensions
-            ]
-        return [
-            p for p in root.iterdir()
-            if p.is_file() and p.suffix.lower() in extensions
+    if args.recursive:
+        print(f"Scanning {args.folder} recursively...", file=sys.stderr, flush=True)
+        ext_set = set(exts)
+        pool = []
+        for dirpath, _, filenames in os.walk(args.folder):
+            for name in filenames:
+                if Path(name).suffix.lower() in ext_set:
+                    pool.append(Path(dirpath) / name)
+    else:
+        pool = [
+            p for p in args.folder.iterdir()
+            if p.is_file() and p.suffix.lower() in exts
         ]
 
-    pool = _collect_videos(args.folder, exts, recursive)
     if len(pool) < args.count:
         raise SystemExit(
             f"Need at least {args.count} videos with extensions {exts}, "
@@ -973,7 +1003,7 @@ def main() -> None:
         )
         for p in initial_paths
     ]
-    rows, cols = compute_grid(args.count, args.rows, args.cols)
+    rows, cols = compute_grid(args.count, grid)
 
     hw_cfg = choose_hwaccel(args.hwaccel)
     if args.verbose:
