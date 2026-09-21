@@ -42,29 +42,28 @@ Keys work when the **pygame window** is focused (not the terminal).
 - q: quit.
 
 ## Architecture
-Replaces the old ffplay-based pipeline with a **pygame viewer**:
 
 ```
-ffmpeg (video) ──rawvideo pipe──▶ pygame viewer (SDL window, keyboard events)
-ffmpeg (audio)  ──wav pipe──────▶ ffplay -nodisp -vn (headless audio)
+per tile: ffmpeg (decode + scale/pad) ──rawvideo pipe──▶ pygame compositor ──▶ window
+per tile: ffmpeg (audio)              ──wav pipe─────▶ ffplay -nodisp -vn (sound server mixes)
 ```
 
 ### VideoWindow
-- `VideoWindow` class owns the pygame window and ffmpeg subprocess lifecycle.
-- `select.select`-based non-blocking frame reads from ffmpeg stdout pipe.
-- `pygame.image.frombuffer()` converts raw RGB bytes to a display surface.
+- `VideoWindow` owns the pygame window and one ffmpeg per tile, plus pygame compositing.
+- Per-tile stdout pipes are non-blocking; `_pump_frames(due)` assembles whole frames and
+  keeps the newest (drops stale) so a tile stays current.
+- `pygame.image.frombuffer()` converts each cell's raw RGB bytes to a surface; `_composite()`
+  blits cells into the wall surface; `_blit_frame()` scales the wall to the window.
 - Keyboard events processed via `pygame.event.get()` — works when SDL window is focused.
-- On tile replace/seek: `_restart_pipeline()` kills the old ffmpeg, starts a new one.
-  **Pygame window stays open** — no flicker.
-- Audio ffplay is SIGSTOPped at spawn and released on the first video frame
-  (`_release_audio`), then video is paced against a monotonic deadline
-  (`_video_deadline`, `MAX_LAG_SECONDS`) so it can't drift away from audio.
+- Replacing/seeking a tile calls `_start_tile(i)` only, so other tiles are untouched.
+- Each tile's ffplay is SIGSTOPped at spawn and released on that tile's first frame
+  (`_release_tile_audio`).
 
 ### Models
 - `VideoMeta`, `HwAccelConfig`, `PipelineConfig`, `TileState` dataclasses.
-- `build_video_cmd(cfg)` builds video ffmpeg argv, returns `(cmd, width, height)`.
-- `build_audio_cmd(cfg)` builds simplified audio-only ffmpeg argv.
-- `_build_filter_graph()` generates the filter_complex string.
+- `build_tile_video_cmd(cfg, i)` builds one tile's video ffmpeg argv, returns `(cmd, w, h)`.
+- `build_tile_audio_cmd(cfg, i)` builds one tile's audio ffmpeg argv (None if muted).
+- `_tile_filter_ops(cfg, tile)` generates the per-tile scale/pad/fps filter chain.
 
 ## Implementation Notes & Tips
 - Subprocess: never use `shell=True`; always pass argv lists.
@@ -74,12 +73,18 @@ ffmpeg (audio)  ──wav pipe──────▶ ffplay -nodisp -vn (headless
 - Tile replace: aim to pick unused, different videos first; fall back gracefully.
 - HW accel: `--hwaccel auto` probes CUDA with runtime lib check, then VAAPI.
 - Display check: verifies `DISPLAY` or `WAYLAND_DISPLAY` is set before init.
-- Audio pipeline: started only when `--no-audio` is not set and at least one tile has audio.
-- A/V sync: audio (fast to start) is gated until the first video frame (slow grid
-  startup); then frames are presented on a `time.monotonic()` deadline and the
-  schedule advances one slot per frame read, so late frames are skipped without
-  dropping every following frame (`MAX_LAG_SECONDS`, `HARD_RESYNC_SECONDS`).
-  Re-anchor on restart/pause-resume.
+- Audio: one ffmpeg→ffplay per tile; the sound server mixes them. ffplay is gated on that
+  tile's first frame, and the video is then held until ffplay's clock actually starts
+  (`_watch_audio_clock` → `_audio_started`). Without that hold, 4K/NFS audio seek latency
+  makes video lead audio by ~0.5 s. `AUDIO_START_TIMEOUT` prevents a permanently black tile
+  if audio fails.
+- Frame pacing: `run()` accumulates `elapsed * VIDEO_FPS` into `_frames_due` and pumps
+  that many frames per tile; content is locked to the wall clock (30 fps) and stalls are
+  absorbed by dropping older frames. Cap via `MAX_CATCHUP_FRAMES`.
+- Pipe sizing: a raw cell frame is far larger than the 64 KB pipe default, so
+  `_start_tile` raises `F_SETPIPE_SZ`. Read a whole frame per pump, not one chunk.
+- Teardown: `kill_proc` uses SIGKILL — children are stateless and graceful waits made
+  tile replacement feel slow.
 - Display scaling: `_blit_frame` scales to *fit* the window and centres with black
   bars, so tiling compositors (niri/sway) can't stretch the grid. Never
   `pygame.transform.scale` the frame straight to the window size.

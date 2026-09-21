@@ -8,9 +8,11 @@ Single-window video wall that plays multiple videos in a grid, using a **pygame*
 - Per-cell sizing via `--cell-width`/`--cell-height`; total size computed from grid.
 - **Rawvideo pipe only** — no H.264 re-encode overhead.
 - **Pygame viewer** replaces ffplay — keyboard shortcuts work when the **video window is focused**, not the terminal.
-- **Window stays alive** on tile replacement/seeking — only ffmpeg restarts, no window flicker.
+- **One decoder per tile** — replacing or seeking a tile restarts only that tile; the
+  other tiles keep playing from where they were (no whole-wall reset, no long stall).
 - Audio options: `--no-audio`, `--audio-mode {mix,one}`, `--audio-tile`, `--audio-rate`.
-  Audio is played through a separate headless ffplay (`-nodisp -vn`) fed from a second ffmpeg instance.
+  Each tile has its own `ffmpeg → ffplay` chain; the sound server mixes the streams
+  (`--volume` applies per stream).
 - **A/V sync**: audio is held (SIGSTOP) until the first video frame is ready, then video
   is paced by a monotonic clock with frame-drop catch-up — so audio no longer starts
   seconds ahead of the slow-to-start grid.
@@ -90,15 +92,25 @@ Keys work when the **pygame video window** is focused (not the terminal).
 ## Architecture
 
 ```
-ffmpeg (video decode + filter graph) ──rawvideo pipe──▶ pygame viewer (display + keys)
-ffmpeg (audio mix only)              ──wav pipe──────▶ ffplay -nodisp -vn (headless audio)
+per tile: ffmpeg (decode + scale/pad) ──rawvideo pipe──▶ pygame compositor ──▶ window
+per tile: ffmpeg (audio only)         ──wav pipe──────▶ ffplay -nodisp -vn (mixed by sound server)
 ```
 
-- **Video pipeline**: Single ffmpeg decodes all input videos, builds an xstack filter graph, and outputs raw RGB24 frames via `image2pipe -` to stdout. The pygame viewer reads frames from the pipe using `select`-based non-blocking reads and displays them via `pygame.image.frombuffer`.
-- **Audio pipeline**: A second ffmpeg runs a simplified audio-only filter graph and outputs PCM/WAV to a second pipe, consumed by a headless ffplay (`-nodisp -vn`). Both pipelines share the same seek positions and are restarted together on tile changes.
-- **A/V sync**: ffplay is SIGSTOPped at spawn and resumed only once the first video frame is on screen, so audio cannot run ahead while the grid is still decoding. From then on, frames are presented against a monotonic deadline and late frames are dropped, keeping the wall locked to audio instead of drifting.
-- **Window persistence**: On tile replace or seek, only ffmpeg subprocesses are killed and restarted. The pygame window stays open — no flicker.
-- **Scaling**: Each frame is scaled to *fit* the current window/surface, centred with black bars, so a tiling compositor resizing the window cannot stretch the grid.
+- **Per-tile video**: one ffmpeg per tile decodes that video, scales/pads it to the cell
+  size (aspect preserved, black bars) and streams raw RGB24. pygame composites the tiles
+  into the wall and scales the wall to the window.
+- **Per-tile audio**: each tile runs its own ffmpeg→ffplay chain; the sound server mixes
+  the streams. `--volume` is applied per stream and `--audio-mode one` starts a single chain.
+- **Isolated tile changes**: replacing or seeking a tile kills and restarts only that tile's
+  processes. Other tiles keep decoding and keep their playback position.
+- **A/V sync**: each tile's ffplay is SIGSTOPped at spawn; once that tile's first video frame
+  is ready, audio is released and the video is held until ffplay's clock actually starts.
+  This absorbs the audio pipeline's seek/startup latency (large for 4K/NFS), so the video
+  can't start first and stay ahead of the audio.
+- **Presentation**: the wall clock decides how many 1/30 s frames each tile should advance
+  per iteration; older frames are dropped so a tile stays current (never races, never freezes).
+- **Scaling**: the composited wall is scaled to *fit* the current window, centred with black
+  bars, so a tiling compositor resizing the window cannot stretch the grid.
 
 ## Notes
 

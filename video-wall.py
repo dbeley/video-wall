@@ -5,16 +5,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
 import glob
 import json
 import math
 import os
 import random
-import select
+import re
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,13 +34,22 @@ DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 MAX_TILES = 16
 TITLE = "Video Wall"
 VIDEO_FPS = 30
-# If video falls more than this far behind its presentation clock (e.g. after
-# a compositor stall or a slow restart), drop frames instead of letting the
-# lag accumulate permanently against the audio.
-MAX_LAG_SECONDS = 0.15
-# When the video is this far behind, stop trying to catch up frame-by-frame and
-# just re-anchor the schedule (accept some drift rather than freezing forever).
-HARD_RESYNC_SECONDS = 2.0
+# Cap on frames discarded at once when catching up after a stall.
+MAX_CATCHUP_FRAMES = 60
+# Max time to wait for a tile's audio to start playing before showing its video
+# anyway (keeps a broken/muted tile from staying black forever).
+AUDIO_START_TIMEOUT = 3.0
+# ffplay status line, e.g. "  12.34 M-A:  0.000 fd=...". The first number is
+# the master (audio) clock in seconds; `nan` lines don't match.
+_AUDIO_POS_RE = re.compile(rb"^\s*([-\d.]+)\s+M-A:")
+
+
+def _pipe_max_size() -> int:
+    try:
+        with open("/proc/sys/fs/pipe-max-size") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 1 << 20
 
 
 # -------- Models --------
@@ -353,165 +364,118 @@ def choose_hwaccel(pref: str | None = None) -> HwAccelConfig:
 
 # -------- ffmpeg command builders --------
 
-
-def _build_filter_graph(cfg: PipelineConfig) -> tuple[list[str], list[str]]:
-    """Build video filter graph. Audio filters are NOT included (separate pipeline)."""
-    flt: list[str] = []
-    vouts: list[str] = []
-
-    stride_w = cfg.cell_w + cfg.border
-    stride_h = cfg.cell_h + cfg.border
-
-    for i, tile in enumerate(cfg.tiles):
-        ops: list[str] = []
-
-        hw = cfg.hwaccel.mode
-        if hw == "cuda":
-            ops.append(
-                f"scale_cuda={cfg.cell_w}:{cfg.cell_h}:"
-                f"force_original_aspect_ratio=decrease"
-            )
-            ops.append("hwdownload")
-            ops.append("format=nv12")
-        elif hw == "vaapi":
-            ops.append(
-                f"scale_vaapi=w={cfg.cell_w}:h={cfg.cell_h}:"
-                f"force_original_aspect_ratio=decrease"
-            )
-            ops.append("hwdownload")
-            ops.append("format=nv12")
-        else:
-            ops.append(
-                f"scale={cfg.cell_w}:{cfg.cell_h}:"
-                f"force_original_aspect_ratio=decrease"
-            )
-
-        ops.append(f"pad={cfg.cell_w}:{cfg.cell_h}:(ow-iw)/2:(oh-ih)/2:black")
-        ops.append("format=yuv420p")
-
-        vouts.append(f"[v{i}]")
-        flt.append(f"[{i}:v]{','.join(ops)}[v{i}]")
-
-    layout_parts: list[str] = []
-    for i in range(len(cfg.tiles)):
-        col = i % cfg.cols
-        row = i // cfg.cols
-        layout_parts.append(f"{col * stride_w}_{row * stride_h}")
-
-    layout = "|".join(layout_parts)
-    flt.append(
-        f"{''.join(vouts)}xstack=inputs={len(cfg.tiles)}:layout={layout},"
-        f"fps={VIDEO_FPS}[V]"
-    )
-
-    return flt, vouts
+# Codecs for which hardware decode is skipped (hardware scale filter would then
+# be applied to software frames and fail).
+_SOFTWARE_ONLY_CODECS = {"mpeg4", "msmpeg4v3", "mpeg1video"}
 
 
-def build_video_cmd(cfg: PipelineConfig) -> tuple[list[str], int, int]:
-    """ffmpeg command: raw RGB frames to stdout (video only, no audio in filter)."""
+def _wants_hw(cfg: PipelineConfig, tile: TileState) -> bool:
+    codec = (tile.metadata.video_codec or "").lower()
+    return cfg.hwaccel.enabled and codec not in _SOFTWARE_ONLY_CODECS
+
+
+def _tile_filter_ops(cfg: PipelineConfig, tile: TileState) -> list[str]:
+    """Per-tile scale/pad/fps chain: fill the cell, preserve aspect, black bars."""
+    ops: list[str] = []
+
+    if _wants_hw(cfg, tile) and cfg.hwaccel.mode == "cuda":
+        ops.append(
+            f"scale_cuda={cfg.cell_w}:{cfg.cell_h}:"
+            f"force_original_aspect_ratio=decrease"
+        )
+        ops += ["hwdownload", "format=nv12"]
+    elif _wants_hw(cfg, tile) and cfg.hwaccel.mode == "vaapi":
+        ops.append(
+            f"scale_vaapi=w={cfg.cell_w}:h={cfg.cell_h}:"
+            f"force_original_aspect_ratio=decrease"
+        )
+        ops += ["hwdownload", "format=nv12"]
+    else:
+        ops.append(
+            f"scale={cfg.cell_w}:{cfg.cell_h}:"
+            f"force_original_aspect_ratio=decrease"
+        )
+
+    ops.append(f"pad={cfg.cell_w}:{cfg.cell_h}:(ow-iw)/2:(oh-ih)/2:black")
+    ops.append("format=yuv420p")
+    ops.append(f"fps={VIDEO_FPS}")
+    return ops
+
+
+def build_tile_video_cmd(cfg: PipelineConfig, index: int) -> tuple[list[str], int, int]:
+    """ffmpeg command for ONE tile: cell-sized raw RGB frames to stdout.
+
+    One process per tile means replacing/seeking a tile never touches the
+    other tiles' decoders (no whole-wall restart, no playback reset).
+    """
+    tile = cfg.tiles[index]
+
     args = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "info" if cfg.verbose else "error",
     ]
-
     for k, v in cfg.hwaccel.global_opts.items():
         args += [k, v]
 
-    for tile in cfg.tiles:
-        meta = tile.metadata
-        codec = (meta.video_codec or "").lower()
-        wants_hw = cfg.hwaccel.enabled and codec not in {
-            "mpeg4",
-            "msmpeg4v3",
-            "mpeg1video",
-        }
+    if cfg.loop:
+        args += ["-stream_loop", "-1"]
+    if _wants_hw(cfg, tile) and cfg.hwaccel.mode == "cuda":
+        args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    elif _wants_hw(cfg, tile) and cfg.hwaccel.mode == "vaapi":
+        args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
 
-        if cfg.loop:
-            args += ["-stream_loop", "-1"]
-        if wants_hw and cfg.hwaccel.mode == "cuda":
-            args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        elif wants_hw and cfg.hwaccel.mode == "vaapi":
-            args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-        path_str = str(tile.path.absolute())
-        args += ["-ss", f"{tile.seek:.3f}", "-i", path_str]
-
-    flt, vouts = _build_filter_graph(cfg)
-    maps = ["-map", "[V]"]
-
-    total_w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
-    total_h = cfg.rows * (cfg.cell_h + cfg.border) - cfg.border
-
-    args += ["-filter_complex", ";".join(flt), *maps, "-s", f"{total_w}x{total_h}"]
-    args += [
-        "-c:v", "rawvideo", "-pix_fmt", "rgb24",
-        "-r", str(VIDEO_FPS),
-        "-f", "image2pipe", "-",
-    ]
-    return args, total_w, total_h
+    args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path.absolute())]
+    args += ["-an", "-vf", ",".join(_tile_filter_ops(cfg, tile))]
+    args += ["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    return args, cfg.cell_w, cfg.cell_h
 
 
-def build_audio_cmd(cfg: PipelineConfig) -> list[str] | None:
-    """Separate ffmpeg command: mix all audio streams → WAV to stdout.
+def build_tile_audio_cmd(cfg: PipelineConfig, index: int) -> list[str] | None:
+    """ffmpeg command for ONE tile's audio → WAV to stdout (None when muted).
 
-    No per-stream volume filters (avoids naming conflicts).
-    Amix weights parameter handles per-input gain directly.
+    Each tile gets its own ffmpeg→ffplay chain, so changing a tile restarts
+    only that tile's audio and the others keep playing. The OS/sound server
+    mixes the per-tile streams (``--volume`` is applied per stream).
     """
-    with_audio = [i for i, t in enumerate(cfg.tiles) if t.metadata.has_audio]
-    if not with_audio:
+    if cfg.no_audio:
+        return None
+    tile = cfg.tiles[index]
+    if not tile.metadata.has_audio:
         return None
 
-    args = [
+    if cfg.audio_mode == "one":
+        with_audio = [i for i, t in enumerate(cfg.tiles) if t.metadata.has_audio]
+        chosen = cfg.audio_tile if cfg.audio_tile in with_audio else with_audio[0]
+        if index != chosen:
+            return None
+
+    return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "info" if cfg.verbose else "error",
+        "-ss", f"{tile.seek:.3f}",
+        "-i", str(tile.path.absolute()),
+        "-vn",
+        "-af", f"aresample=async=1:min_hard_comp=0.100,volume={cfg.volume}",
+        "-c:a", "pcm_s16le", "-ar", str(cfg.audio_rate),
+        "-f", "wav", "-",
     ]
-    for t in cfg.tiles:
-        args += ["-ss", f"{t.seek:.3f}", "-i", str(t.path.absolute())]
-
-    # Build audio filter: connect streams directly to amix (no volume filters)
-    flt_parts: list[str] = []
-    if cfg.audio_mode == "one":
-        chosen = with_audio[0] if cfg.audio_tile is None else cfg.audio_tile
-        if chosen not in with_audio:
-            chosen = with_audio[0]
-        flt_parts.append(
-            f"[{chosen}:a]aresample=async=1:min_hard_comp=0.100[A]"
-        )
-    else:
-        flt_parts.append(
-            f"{''.join(f'[{i}:a]' for i in with_audio)}"
-            f"amix=inputs={len(with_audio)}:"
-            f"dropout_transition=200:weights={cfg.volume}"
-            f"[Apre]"
-        )
-        flt_parts.append("[Apre]aresample=async=1:min_hard_comp=0.100[A]")
-
-    args += ["-filter_complex", ";".join(flt_parts)]
-    args += ["-map", "[A]", "-c:a", "pcm_s16le", "-ar", str(cfg.audio_rate)]
-    args += ["-f", "wav", "-"]
-    return args
 
 
 # -------- Kill helper --------
 
 
 def kill_proc(p: subprocess.Popen | None) -> None:
+    """Immediately tear down a child decoder/player (stateless, so SIGKILL)."""
     if p is None:
         return
-    try:
-        p.terminate()
-    except Exception:
-        pass
-    try:
-        p.wait(timeout=0.3)
-    except Exception:
-        try:
-            p.kill()
-        except Exception:
-            pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        p.kill()
+    with contextlib.suppress(Exception):
+        p.wait(timeout=0.2)
 
 
 def signal_proc(p: subprocess.Popen | None, sig: int) -> None:
@@ -554,21 +518,36 @@ class VideoWindow:
 
         self.width = width
         self.height = height
-        self.frame_size = width * height * 3
         self.verbose = verbose
         self.running = False
         self.paused = False
 
-        self._ffmpeg_vid: subprocess.Popen | None = None
-        self._ffmpeg_aud: subprocess.Popen | None = None
-        self._ffplay_aud: subprocess.Popen | None = None
         self._pending_seek: float | None = None
         self._clock = pygame.time.Clock()
-        # Audio is held (SIGSTOP) until the first video frame is ready so it
-        # cannot run ahead of the much slower-starting video grid.
-        self._audio_gated = False
-        # Monotonic deadline for the next frame; None re-anchors on next frame.
-        self._video_deadline: float | None = None
+
+        # One decoder per tile, composited by pygame. These lists mirror
+        # len(self._tiles) and let a replace/seek touch only one tile.
+        self._vid_procs: list[subprocess.Popen | None] = []
+        self._vid_bufs: list[bytearray] = []
+        self._tile_surfaces: list[pygame.Surface | None] = []
+        self._aud_ffmpeg: list[subprocess.Popen | None] = []
+        self._aud_ffplay: list[subprocess.Popen | None] = []
+        self._audio_gated: list[bool] = []  # per-tile: audio held for first frame
+        self._audio_started: list[bool] = []  # per-tile: ffplay clock is running
+        self._audio_pos: list[float | None] = []  # per-tile ffplay clock (s)
+        self._audio_release_wall: list[float | None] = []
+        self._vid_allowed: list[bool] = []  # per-tile: may present video
+        self._rows = 0
+        self._cols = 0
+        self._border = 0
+        self._cell_w = 0
+        self._cell_h = 0
+        self._tile_frame_size = 0
+        self._wall: pygame.Surface | None = None
+        # Wall-clock frame budget: content advances at VIDEO_FPS regardless of
+        # how fast the loop actually iterates.
+        self._last_tick: float | None = None
+        self._frames_due = 0.0
 
         # External state
         self._tiles: list[TileState] = []
@@ -579,106 +558,230 @@ class VideoWindow:
         self._loop = False
         self._make_cfg = None
 
-    # ----- Audio -----
+    # ----- Per-tile pipelines -----
 
-    def _start_audio(self, cmd: list[str] | None) -> None:
-        """Start audio pipeline: ffmpeg → WAV pipe → ffplay.
+    def _cfg(self) -> PipelineConfig:
+        return self._make_cfg(self._tiles)
 
-        ffplay is started FIRST so the pipe has a reader before ffmpeg
-        opens it. This avoids blocking on write.
+    def _start_tile(self, index: int) -> None:
+        """(Re)start video + audio for a single tile only."""
+        cfg = self._cfg()
+        self._stop_tile_video(index)
+        self._stop_tile_audio(index)
 
-        ffplay is then SIGSTOPped until the first video frame is displayed:
-        audio starts in ~2s, but a 6-tile grid can take several seconds to
-        produce its first frame, so ungated audio would immediately lead the
-        video by that whole startup difference.
-        """
-        kill_proc(self._ffmpeg_aud)
-        kill_proc(self._ffplay_aud)
-        self._ffmpeg_aud = None
-        self._ffplay_aud = None
-        self._audio_gated = False
-
-        if not cmd:
-            return
-        if not shutil.which("ffplay"):
-            if self.verbose:
-                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
-            return
-
-        # ffplay first (blocks on pipe read until ffmpeg writes)
-        self._ffplay_aud = subprocess.Popen(
-            [
-                "ffplay",
-                "-nodisp", "-vn",
-                "-loglevel", "info" if self.verbose else "error",
-                "-autoexit",
-                "-i", "pipe:0",
-            ],
-            stdin=subprocess.PIPE,
-        )
-        signal_proc(self._ffplay_aud, signal.SIGSTOP)
-        self._audio_gated = self._ffplay_aud.poll() is None
-        # ffmpeg second (writes to pipe → ffplay reads it)
-        self._ffmpeg_aud = subprocess.Popen(cmd, stdout=self._ffplay_aud.stdin)
-
-    def _release_audio(self) -> None:
-        """Resume gated ffplay once the first video frame is on screen."""
-        if not self._audio_gated:
-            return
-        self._audio_gated = False
-        signal_proc(self._ffplay_aud, signal.SIGCONT)
-
-    def _stop_audio(self) -> None:
-        kill_proc(self._ffmpeg_aud)
-        kill_proc(self._ffplay_aud)
-        self._ffmpeg_aud = None
-        self._ffplay_aud = None
-        self._audio_gated = False
-
-    # ----- Video -----
-
-    def _start_video(self, cmd: list[str]) -> None:
-        kill_proc(self._ffmpeg_vid)
-        self._ffmpeg_vid = subprocess.Popen(
-            cmd,
+        vid_cmd, _, _ = build_tile_video_cmd(cfg, index)
+        proc = subprocess.Popen(
+            vid_cmd,
             stdout=subprocess.PIPE,
             stderr=None if self.verbose else subprocess.DEVNULL,
         )
+        if proc.stdout is not None:
+            fd = proc.stdout.fileno()
+            # A raw frame (e.g. 480x270x3 = 388 KB) is far bigger than the
+            # default 64 KB pipe; grow it so a whole frame can be buffered and
+            # read without stalling the loop.
+            want = max(self._tile_frame_size * 4, 1 << 20)
+            setpipesz = getattr(fcntl, "F_SETPIPE_SZ", None)
+            if setpipesz is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    fcntl.fcntl(fd, setpipesz, min(want, _pipe_max_size()))
+            with contextlib.suppress(OSError, ValueError):
+                os.set_blocking(fd, False)
+        self._vid_procs[index] = proc
+        self._vid_bufs[index] = bytearray()
+        self._tile_surfaces[index] = None
+        self._audio_started[index] = False
+        self._audio_pos[index] = None
+        self._audio_release_wall[index] = None
 
-    def _stop_video(self) -> None:
-        kill_proc(self._ffmpeg_vid)
-        self._ffmpeg_vid = None
+        aud_cmd = build_tile_audio_cmd(cfg, index)
+        self._vid_allowed[index] = aud_cmd is None
+        if aud_cmd:
+            self._start_tile_audio(index, aud_cmd)
+
+        if self.paused:
+            signal_proc(proc, signal.SIGSTOP)
+            signal_proc(self._aud_ffmpeg[index], signal.SIGSTOP)
+
+    def _stop_tile_video(self, index: int) -> None:
+        kill_proc(self._vid_procs[index])
+        self._vid_procs[index] = None
+
+    def _start_tile_audio(self, index: int, cmd: list[str]) -> None:
+        if not shutil.which("ffplay"):
+            if self.verbose:
+                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
+            self._vid_allowed[index] = True
+            return
+        # ffplay first (reader), held until this tile's first video frame; then
+        # we wait for its clock to actually start before showing the video.
+        ffplay = subprocess.Popen(
+            [
+                "ffplay", "-nodisp", "-vn",
+                # info level so the status line (audio clock) is emitted.
+                "-loglevel", "info",
+                "-autoexit", "-i", "pipe:0",
+            ],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self._aud_ffplay[index] = ffplay
+        self._audio_started[index] = False
+        signal_proc(ffplay, signal.SIGSTOP)
+        self._audio_gated[index] = ffplay.poll() is None
+        threading.Thread(
+            target=self._watch_audio_clock, args=(index, ffplay), daemon=True
+        ).start()
+        # ffmpeg second (writes into ffplay stdin)
+        self._aud_ffmpeg[index] = subprocess.Popen(cmd, stdout=ffplay.stdin)
+
+    def _watch_audio_clock(self, index: int, proc: subprocess.Popen) -> None:
+        """Set ``_audio_started[index]`` when ffplay reports it is playing."""
+        if proc.stderr is None:
+            return
+        fd = proc.stderr.fileno()
+        pending = b""
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            pending += chunk
+            parts = re.split(rb"[\r\n]", pending)
+            pending = parts.pop()
+            for line in parts:
+                m = _AUDIO_POS_RE.match(line)
+                if m and self._aud_ffplay[index] is proc:
+                    self._audio_pos[index] = float(m.group(1))
+                    self._audio_started[index] = True
+
+    def _release_tile_audio(self, index: int) -> None:
+        if index < len(self._audio_gated) and self._audio_gated[index]:
+            self._audio_gated[index] = False
+            self._audio_release_wall[index] = time.monotonic()
+            signal_proc(self._aud_ffplay[index], signal.SIGCONT)
+
+    def _audio_timed_out(self, index: int) -> bool:
+        released = self._audio_release_wall[index]
+        return released is not None and time.monotonic() - released > AUDIO_START_TIMEOUT
+
+    def _stop_tile_audio(self, index: int) -> None:
+        kill_proc(self._aud_ffmpeg[index])
+        kill_proc(self._aud_ffplay[index])
+        self._aud_ffmpeg[index] = None
+        self._aud_ffplay[index] = None
+        self._audio_gated[index] = False
+        self._audio_started[index] = False
+        self._audio_pos[index] = None
+        self._audio_release_wall[index] = None
 
     def _stop_procs(self) -> None:
-        self._stop_video()
-        self._stop_audio()
+        for i in range(len(self._vid_procs)):
+            self._stop_tile_video(i)
+            self._stop_tile_audio(i)
 
-    def _read_frame(self) -> bytes | None:
-        """Read one raw RGB frame from the video pipe.
+    def _start_all(self) -> None:
+        """Build all tile decoders for the current grid."""
+        cfg = self._cfg()
+        self._rows, self._cols = cfg.rows, cfg.cols
+        self._cell_w, self._cell_h = cfg.cell_w, cfg.cell_h
+        self._border = cfg.border
 
-        Uses select with a 10ms timeout so we don't block event processing.
-        Returns None if the pipe is dead, b"" if no data ready yet.
-        If a partial frame is read (e.g. after SIGCONT resume), we block
-        until the full frame arrives rather than returning None (which
-        would trigger a spurious pipeline restart).
+        w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
+        h = cfg.rows * (cfg.cell_h + cfg.border) - cfg.border
+        if (w, h) != (self.width, self.height):
+            self.width, self.height = w, h
+            self.screen = pygame.display.set_mode((w, h), self.screen.get_flags())
+        self._tile_frame_size = cfg.cell_w * cfg.cell_h * 3
+        self._wall = pygame.Surface((w, h))
+
+        n = len(self._tiles)
+        self._vid_procs = [None] * n
+        self._vid_bufs = [bytearray() for _ in range(n)]
+        self._tile_surfaces = [None] * n
+        self._aud_ffmpeg = [None] * n
+        self._aud_ffplay = [None] * n
+        self._audio_gated = [False] * n
+        self._audio_started = [False] * n
+        self._audio_pos = [None] * n
+        self._audio_release_wall = [None] * n
+        self._vid_allowed = [True] * n
+        for i in range(n):
+            self._start_tile(i)
+
+    def _pump_frames(self, due: int) -> None:
+        """Advance every tile by ``due`` frames of content (newest wins).
+
+        ``due`` comes from the wall clock (see ``run``), so content plays at
+        ``VIDEO_FPS`` even if the loop iterates faster or slower. When behind,
+        older frames are discarded so a tile snaps back to the present.
         """
-        if self._ffmpeg_vid is None or self._ffmpeg_vid.stdout is None:
-            return None
-        if self._ffmpeg_vid.poll() is not None:
-            return None
+        if due <= 0:
+            return
+        fs = self._tile_frame_size
+        want = fs * due
+        for i, proc in enumerate(self._vid_procs):
+            if proc is None or proc.stdout is None or proc.poll() is not None:
+                continue
+            fd = proc.stdout.fileno()
+            buf = self._vid_bufs[i]
 
-        fd = self._ffmpeg_vid.stdout.fileno()
-        r, _, _ = select.select([fd], [], [], 0.01)
-        if not r:
-            return b""
+            if not self._vid_allowed[i]:
+                # Hold this tile's video until its audio pipeline is actually
+                # playing (its seek can take a while on 4K/NFS), otherwise the
+                # video would start first and stay ahead of the audio.
+                while len(buf) < fs:
+                    try:
+                        data = os.read(fd, fs - len(buf))
+                    except (BlockingIOError, InterruptedError, OSError):
+                        break
+                    if not data:
+                        break
+                    buf += data
+                if len(buf) < fs:
+                    continue
+                if self._audio_release_wall[i] is None:
+                    self._audio_release_wall[i] = time.monotonic()
+                if self._audio_gated[i]:
+                    self._release_tile_audio(i)
+                    continue
+                if not self._audio_started[i] and not self._audio_timed_out(i):
+                    continue
+                self._vid_allowed[i] = True
 
-        # Read full frame — handles partial pipe reads gracefully
-        raw = self._ffmpeg_vid.stdout.read(self.frame_size)
-        if len(raw) != self.frame_size:
-            # Partial frame (possible after SIGCONT) — don't restart,
-            # just wait for the next iteration
-            return None if len(raw) == 0 else b""
-        return raw
+            while len(buf) < want:
+                try:
+                    data = os.read(fd, want - len(buf))
+                except (BlockingIOError, InterruptedError, OSError):
+                    break
+                if not data:
+                    break
+                buf += data
+
+            if len(buf) < fs:
+                continue
+            avail = len(buf) // fs
+            # Present the newest available frame, drop the rest (catch-up).
+            frame = bytes(buf[(avail - 1) * fs: avail * fs])
+            del buf[: avail * fs]
+            self._tile_surfaces[i] = pygame.image.frombuffer(
+                frame, (self._cell_w, self._cell_h), "RGB"
+            )
+
+    def _composite(self) -> None:
+        if self._wall is None:
+            return
+        self._wall.fill((0, 0, 0))
+        stride_w = self._cell_w + self._border
+        stride_h = self._cell_h + self._border
+        for i, surf in enumerate(self._tile_surfaces):
+            if surf is None:
+                continue
+            col = i % self._cols
+            row = i // self._cols
+            self._wall.blit(surf, (col * stride_w, row * stride_h))
 
     # ----- Keyboard -----
 
@@ -718,24 +821,23 @@ class VideoWindow:
 
     def _toggle_pause(self) -> None:
         if not self.paused:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud, self._ffplay_aud):
-                signal_proc(p, signal.SIGSTOP)
+            for i in range(len(self._vid_procs)):
+                signal_proc(self._vid_procs[i], signal.SIGSTOP)
+                signal_proc(self._aud_ffmpeg[i], signal.SIGSTOP)
+                signal_proc(self._aud_ffplay[i], signal.SIGSTOP)
             self.paused = True
         else:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud):
-                signal_proc(p, signal.SIGCONT)
-            # Keep audio held if it was gated (no first frame yet).
-            if not self._audio_gated:
-                signal_proc(self._ffplay_aud, signal.SIGCONT)
+            for i in range(len(self._vid_procs)):
+                signal_proc(self._vid_procs[i], signal.SIGCONT)
+                signal_proc(self._aud_ffmpeg[i], signal.SIGCONT)
+                # Keep audio held if this tile's first frame is still pending.
+                if not self._audio_gated[i]:
+                    signal_proc(self._aud_ffplay[i], signal.SIGCONT)
             self.paused = False
-            # Re-anchor the presentation clock; otherwise the whole pause
-            # duration would be treated as lag and burn through frames.
-            self._video_deadline = None
 
     # ----- Pipeline lifecycle -----
 
-    def _replace_tile(self, index: int, restart: bool = True,
-                      ban: Path | None = None) -> None:
+    def _replace_tile(self, index: int, ban: Path | None = None) -> None:
         if not (0 <= index < len(self._tiles)):
             return
 
@@ -765,15 +867,9 @@ class VideoWindow:
             "unused+different",
         )
         if new_path is None:
-            new_path = _pick(
-                [p for p in pool if p not in active_paths],
-                "unused",
-            )
+            new_path = _pick([p for p in pool if p not in active_paths], "unused")
         if new_path is None:
-            new_path = _pick(
-                [p for p in pool if p != current_path],
-                "any different",
-            )
+            new_path = _pick([p for p in pool if p != current_path], "any different")
         if new_path is None:
             if self.verbose:
                 print("[info] replace: fallback to current", file=sys.stderr)
@@ -783,42 +879,15 @@ class VideoWindow:
             path=new_path,
             seek=random_seek(new_path, self._loop, self._start_pct, self._end_pct),
         )
-        if restart:
-            self._restart_pipeline()
+        # Only this tile restarts; the others keep playing untouched.
+        self._start_tile(index)
 
     def _seek_tile(self, index: int, delta: float) -> None:
         if not (0 <= index < len(self._tiles)):
             return
         t = self._tiles[index]
         t.seek = normalize_seek(t.path, t.seek + delta, self._loop)
-        self._restart_pipeline()
-
-    def _restart_pipeline(self) -> None:
-        """Kill all and restart video + audio pipelines. Window stays open."""
-        if self._make_cfg is None:
-            return
-
-        self._video_deadline = None
-        cfg = self._make_cfg(self._tiles)
-        vid_cmd, w, h = build_video_cmd(cfg)
-        aud_cmd = None if cfg.no_audio else build_audio_cmd(cfg)
-
-        if (w, h) != (self.width, self.height):
-            self.width = w
-            self.height = h
-            self.frame_size = w * h * 3
-            flags = self.screen.get_flags()
-            self.screen = pygame.display.set_mode((w, h), flags)
-
-        # ffplay first → then ffmpeg video → then ffmpeg audio
-        # Audio ffplay started BEFORE video+audio ffmpeg so pipes are ready
-        self._start_audio(aud_cmd)
-        self._start_video(vid_cmd)
-
-        # If a tile was replaced while paused, hold the fresh processes too.
-        if self.paused:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud):
-                signal_proc(p, signal.SIGSTOP)
+        self._start_tile(index)
 
     def run(
         self,
@@ -829,7 +898,7 @@ class VideoWindow:
         loop: bool,
         make_cfg,
     ) -> None:
-        """Main loop: read frames, display, handle pygame events."""
+        """Main loop: pump tile decoders, composite, handle pygame events."""
         self._tiles = tiles
         self._pool = pool
         self._start_pct = start_pct
@@ -838,7 +907,7 @@ class VideoWindow:
         self._make_cfg = make_cfg
         self.running = True
 
-        self._restart_pipeline()
+        self._start_all()
 
         print(
             "Controls:\n"
@@ -863,60 +932,36 @@ class VideoWindow:
                 if not self.running:
                     break
 
-                if self._ffmpeg_vid is not None and self._ffmpeg_vid.poll() is not None:
-                    if not self.paused:
-                        try:
-                            idx = random.randrange(len(self._tiles))
-                            self._replace_tile(idx, ban=self._tiles[idx].path)
-                            continue
-                        except Exception:
-                            pass
-                    self._restart_pipeline()
+                if not self.paused:
+                    # Recycle any tile whose decoder died (EOF, corrupt file…).
+                    for i, proc in enumerate(self._vid_procs):
+                        if proc is not None and proc.poll() is not None:
+                            self._replace_tile(i, ban=self._tiles[i].path)
+                            break
 
-                if self.paused:
-                    self._clock.tick(VIDEO_FPS)
-                    continue
+                    # How many 1/30s frames of content should have advanced?
+                    now = time.monotonic()
+                    if self._last_tick is None:
+                        self._last_tick = now
+                        self._frames_due = 1.0
+                    else:
+                        self._frames_due += (now - self._last_tick) * VIDEO_FPS
+                        self._last_tick = now
+                    due = int(self._frames_due)
+                    self._frames_due -= due
+                    if due > MAX_CATCHUP_FRAMES:
+                        due = MAX_CATCHUP_FRAMES
+                        self._frames_due = 0.0
 
-                frame_data = self._read_frame()
-
-                if frame_data is None:
-                    if self._ffmpeg_vid is not None:
-                        idx = random.randrange(len(self._tiles))
-                        self._replace_tile(idx, ban=self._tiles[idx].path)
-                    continue
-
-                if frame_data == b"":
-                    # No frame ready yet; _read_frame already waited via select.
-                    continue
-
-                now = time.monotonic()
-                if self._video_deadline is None:
-                    # Anchor the clock to the first frame after a (re)start and
-                    # only now let audio roll, so it can't lead the video.
-                    self._video_deadline = now
-                    self._release_audio()
+                    self._pump_frames(due)
+                    self._composite()
+                    if self._wall is not None:
+                        self._blit_frame(self._wall)
+                        pygame.display.flip()
                 else:
-                    # One schedule slot per frame, whether shown or skipped.
-                    self._video_deadline += 1.0 / VIDEO_FPS
+                    self._last_tick = None
 
-                # If we're badly behind (slow restart, NFS hiccup, compositor
-                # stall), skip this frame. The schedule still advanced above,
-                # so we catch up instead of dropping every later frame forever.
-                if now > self._video_deadline + MAX_LAG_SECONDS:
-                    if now - self._video_deadline > HARD_RESYNC_SECONDS:
-                        # Hopelessly behind (decode can't keep up): re-anchor
-                        # and accept drift rather than freezing on old frames.
-                        self._video_deadline = now
-                    continue
-
-                if now < self._video_deadline:
-                    time.sleep(self._video_deadline - now)
-
-                surface = pygame.image.frombuffer(
-                    frame_data, (self.width, self.height), "RGB"
-                )
-                self._blit_frame(surface)
-                pygame.display.flip()
+                self._clock.tick(VIDEO_FPS)
         finally:
             self._stop_procs()
             pygame.display.quit()
