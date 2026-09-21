@@ -10,7 +10,7 @@
 - `direnv allow` — load nix shell and env (requires direnv).
 - `nix-shell` — enter dev shell with Python, ruff, ffmpeg, and pygame.
 - `python3 video-wall.py <folder>` — run video wall.
-  - Example: `python3 video-wall.py ~/videos --count 9 --preset 3x3`.
+  - Example: `python3 video-wall.py ~/videos --count 9 --grid 3x3`.
 - `ruff check .` — lint Python code.
 
 Runtime dependencies: `ffmpeg`, `ffprobe` in `PATH`. `ffplay` needed only for audio.
@@ -54,14 +54,16 @@ ffmpeg (audio)  ──wav pipe──────▶ ffplay -nodisp -vn (headless
 - `select.select`-based non-blocking frame reads from ffmpeg stdout pipe.
 - `pygame.image.frombuffer()` converts raw RGB bytes to a display surface.
 - Keyboard events processed via `pygame.event.get()` — works when SDL window is focused.
-- On tile replace/seek: `_restart_ffmpeg()` kills the old ffmpeg, starts a new one.
+- On tile replace/seek: `_restart_pipeline()` kills the old ffmpeg, starts a new one.
   **Pygame window stays open** — no flicker.
-- `AudioPipeline` helper manages a separate ffmpeg→ffplay chain for audio.
+- Audio ffplay is SIGSTOPped at spawn and released on the first video frame
+  (`_release_audio`), then video is paced against a monotonic deadline
+  (`_video_deadline`, `MAX_LAG_SECONDS`) so it can't drift away from audio.
 
 ### Models
 - `VideoMeta`, `HwAccelConfig`, `PipelineConfig`, `TileState` dataclasses.
-- `build_ffmpeg_cmd(cfg)` builds video ffmpeg argv, returns `(cmd, width, height)`.
-- `_build_audio_cmd(cfg)` builds simplified audio-only ffmpeg argv.
+- `build_video_cmd(cfg)` builds video ffmpeg argv, returns `(cmd, width, height)`.
+- `build_audio_cmd(cfg)` builds simplified audio-only ffmpeg argv.
 - `_build_filter_graph()` generates the filter_complex string.
 
 ## Implementation Notes & Tips
@@ -73,6 +75,14 @@ ffmpeg (audio)  ──wav pipe──────▶ ffplay -nodisp -vn (headless
 - HW accel: `--hwaccel auto` probes CUDA with runtime lib check, then VAAPI.
 - Display check: verifies `DISPLAY` or `WAYLAND_DISPLAY` is set before init.
 - Audio pipeline: started only when `--no-audio` is not set and at least one tile has audio.
+- A/V sync: audio (fast to start) is gated until the first video frame (slow grid
+  startup); then frames are presented on a `time.monotonic()` deadline and the
+  schedule advances one slot per frame read, so late frames are skipped without
+  dropping every following frame (`MAX_LAG_SECONDS`, `HARD_RESYNC_SECONDS`).
+  Re-anchor on restart/pause-resume.
+- Display scaling: `_blit_frame` scales to *fit* the window and centres with black
+  bars, so tiling compositors (niri/sway) can't stretch the grid. Never
+  `pygame.transform.scale` the frame straight to the window size.
 
 ## Testing Guidelines
 - Primary: manual runs against a local folder with supported extensions.

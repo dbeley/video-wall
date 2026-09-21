@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import json
 import math
@@ -14,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -30,6 +32,13 @@ DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 MAX_TILES = 16
 TITLE = "Video Wall"
 VIDEO_FPS = 30
+# If video falls more than this far behind its presentation clock (e.g. after
+# a compositor stall or a slow restart), drop frames instead of letting the
+# lag accumulate permanently against the audio.
+MAX_LAG_SECONDS = 0.15
+# When the video is this far behind, stop trying to catch up frame-by-frame and
+# just re-anchor the schedule (accept some drift rather than freezing forever).
+HARD_RESYNC_SECONDS = 2.0
 
 
 # -------- Models --------
@@ -505,6 +514,14 @@ def kill_proc(p: subprocess.Popen | None) -> None:
             pass
 
 
+def signal_proc(p: subprocess.Popen | None, sig: int) -> None:
+    """Best-effort delivery of SIGSTOP/SIGCONT (process may already be gone)."""
+    if p is None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(p.pid, sig)
+
+
 # -------- Pygame viewer --------
 
 
@@ -547,6 +564,11 @@ class VideoWindow:
         self._ffplay_aud: subprocess.Popen | None = None
         self._pending_seek: float | None = None
         self._clock = pygame.time.Clock()
+        # Audio is held (SIGSTOP) until the first video frame is ready so it
+        # cannot run ahead of the much slower-starting video grid.
+        self._audio_gated = False
+        # Monotonic deadline for the next frame; None re-anchors on next frame.
+        self._video_deadline: float | None = None
 
         # External state
         self._tiles: list[TileState] = []
@@ -564,11 +586,17 @@ class VideoWindow:
 
         ffplay is started FIRST so the pipe has a reader before ffmpeg
         opens it. This avoids blocking on write.
+
+        ffplay is then SIGSTOPped until the first video frame is displayed:
+        audio starts in ~2s, but a 6-tile grid can take several seconds to
+        produce its first frame, so ungated audio would immediately lead the
+        video by that whole startup difference.
         """
         kill_proc(self._ffmpeg_aud)
         kill_proc(self._ffplay_aud)
         self._ffmpeg_aud = None
         self._ffplay_aud = None
+        self._audio_gated = False
 
         if not cmd:
             return
@@ -588,14 +616,24 @@ class VideoWindow:
             ],
             stdin=subprocess.PIPE,
         )
+        signal_proc(self._ffplay_aud, signal.SIGSTOP)
+        self._audio_gated = self._ffplay_aud.poll() is None
         # ffmpeg second (writes to pipe → ffplay reads it)
         self._ffmpeg_aud = subprocess.Popen(cmd, stdout=self._ffplay_aud.stdin)
+
+    def _release_audio(self) -> None:
+        """Resume gated ffplay once the first video frame is on screen."""
+        if not self._audio_gated:
+            return
+        self._audio_gated = False
+        signal_proc(self._ffplay_aud, signal.SIGCONT)
 
     def _stop_audio(self) -> None:
         kill_proc(self._ffmpeg_aud)
         kill_proc(self._ffplay_aud)
         self._ffmpeg_aud = None
         self._ffplay_aud = None
+        self._audio_gated = False
 
     # ----- Video -----
 
@@ -681,20 +719,18 @@ class VideoWindow:
     def _toggle_pause(self) -> None:
         if not self.paused:
             for p in (self._ffmpeg_vid, self._ffmpeg_aud, self._ffplay_aud):
-                if p is not None:
-                    try:
-                        os.kill(p.pid, signal.SIGSTOP)
-                    except Exception:
-                        pass
+                signal_proc(p, signal.SIGSTOP)
             self.paused = True
         else:
-            for p in (self._ffmpeg_vid, self._ffmpeg_aud, self._ffplay_aud):
-                if p is not None:
-                    try:
-                        os.kill(p.pid, signal.SIGCONT)
-                    except Exception:
-                        pass
+            for p in (self._ffmpeg_vid, self._ffmpeg_aud):
+                signal_proc(p, signal.SIGCONT)
+            # Keep audio held if it was gated (no first frame yet).
+            if not self._audio_gated:
+                signal_proc(self._ffplay_aud, signal.SIGCONT)
             self.paused = False
+            # Re-anchor the presentation clock; otherwise the whole pause
+            # duration would be treated as lag and burn through frames.
+            self._video_deadline = None
 
     # ----- Pipeline lifecycle -----
 
@@ -762,6 +798,7 @@ class VideoWindow:
         if self._make_cfg is None:
             return
 
+        self._video_deadline = None
         cfg = self._make_cfg(self._tiles)
         vid_cmd, w, h = build_video_cmd(cfg)
         aud_cmd = None if cfg.no_audio else build_audio_cmd(cfg)
@@ -775,10 +812,13 @@ class VideoWindow:
 
         # ffplay first → then ffmpeg video → then ffmpeg audio
         # Audio ffplay started BEFORE video+audio ffmpeg so pipes are ready
-        if aud_cmd:
-            self._start_audio(aud_cmd)
-
+        self._start_audio(aud_cmd)
         self._start_video(vid_cmd)
+
+        # If a tile was replaced while paused, hold the fresh processes too.
+        if self.paused:
+            for p in (self._ffmpeg_vid, self._ffmpeg_aud):
+                signal_proc(p, signal.SIGSTOP)
 
     def run(
         self,
@@ -833,34 +873,75 @@ class VideoWindow:
                             pass
                     self._restart_pipeline()
 
+                if self.paused:
+                    self._clock.tick(VIDEO_FPS)
+                    continue
+
                 frame_data = self._read_frame()
 
                 if frame_data is None:
-                    if not self.paused and self._ffmpeg_vid is not None:
+                    if self._ffmpeg_vid is not None:
                         idx = random.randrange(len(self._tiles))
                         self._replace_tile(idx, ban=self._tiles[idx].path)
                     continue
 
                 if frame_data == b"":
-                    self._clock.tick(VIDEO_FPS)
+                    # No frame ready yet; _read_frame already waited via select.
                     continue
+
+                now = time.monotonic()
+                if self._video_deadline is None:
+                    # Anchor the clock to the first frame after a (re)start and
+                    # only now let audio roll, so it can't lead the video.
+                    self._video_deadline = now
+                    self._release_audio()
+                else:
+                    # One schedule slot per frame, whether shown or skipped.
+                    self._video_deadline += 1.0 / VIDEO_FPS
+
+                # If we're badly behind (slow restart, NFS hiccup, compositor
+                # stall), skip this frame. The schedule still advanced above,
+                # so we catch up instead of dropping every later frame forever.
+                if now > self._video_deadline + MAX_LAG_SECONDS:
+                    if now - self._video_deadline > HARD_RESYNC_SECONDS:
+                        # Hopelessly behind (decode can't keep up): re-anchor
+                        # and accept drift rather than freezing on old frames.
+                        self._video_deadline = now
+                    continue
+
+                if now < self._video_deadline:
+                    time.sleep(self._video_deadline - now)
 
                 surface = pygame.image.frombuffer(
                     frame_data, (self.width, self.height), "RGB"
                 )
-
-                win_w, win_h = self.screen.get_size()
-                if win_w != self.width or win_h != self.height:
-                    surface = pygame.transform.scale(surface, (win_w, win_h))
-
-                self.screen.blit(surface, (0, 0))
+                self._blit_frame(surface)
                 pygame.display.flip()
-
-                self._clock.tick(VIDEO_FPS)
         finally:
             self._stop_procs()
             pygame.display.quit()
             pygame.quit()
+
+    def _blit_frame(self, surface: pygame.Surface) -> None:
+        """Show a frame, preserving aspect ratio with black bars.
+
+        A tiling compositor (e.g. niri) can resize the window to something
+        that no longer matches the grid, so scale to *fit* and centre instead
+        of stretching the wall to fill.
+        """
+        win_w, win_h = self.screen.get_size()
+        if (win_w, win_h) == (self.width, self.height):
+            self.screen.blit(surface, (0, 0))
+            return
+
+        scale = min(win_w / self.width, win_h / self.height)
+        dst_w = max(1, int(self.width * scale))
+        dst_h = max(1, int(self.height * scale))
+        self.screen.fill((0, 0, 0))
+        self.screen.blit(
+            pygame.transform.scale(surface, (dst_w, dst_h)),
+            ((win_w - dst_w) // 2, (win_h - dst_h) // 2),
+        )
 
 
 # -------- Main --------
