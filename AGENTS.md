@@ -34,11 +34,12 @@ Keys work when the **pygame window** is focused (not the terminal).
 
 - SPACE: pause/resume pipeline.
 - r: replace a random tile.
-- 1..9: replace a specific tile (1-indexed).
-- a..f: replace tiles 10-15.
-- 0: replace the last tile (tile 16).
-- f/b: seek +10s/-10s, then press a tile number.
-- Shift+f/b: seek +30s/-30s.
+- 1..9: replace tiles 1–9.
+- 0: replace tile 10.
+- a..f: replace tiles 11–16.
+- Left/Right: seek -10s/+10s, then press a tile key.
+- Shift+Left/Right: seek -30s/+30s.
+- right-click: replace the tile under the cursor.
 - q: quit.
 
 ## Architecture

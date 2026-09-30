@@ -75,18 +75,20 @@ Examples:
 | `--fullscreen / -f` | off | Fullscreen mode |
 | `--hwaccel` | off | `auto`, `off`, `cuda`, `vaapi` |
 
-## Keyboard Controls
+## Keyboard & Mouse Controls
 
-Keys work when the **pygame video window** is focused (not the terminal).
+Keyboard and mouse events work when the **pygame video window** is focused (not the terminal).
 
 | Key | Action |
 |-----|--------|
 | SPACE | pause/resume |
 | r | replace a random tile |
-| 1-9 | replace specific tile (1-indexed) |
-| a-f | replace tiles 10–15 (0 = last tile) |
-| f/b | seek forward/backward 10s, then press a tile |
-| Shift+f/b | seek forward/backward 30s |
+| 1-9 | replace tiles 1–9 |
+| 0 | replace tile 10 |
+| a-f | replace tiles 11–16 |
+| Left/Right | seek backward/forward 10s, then press a tile |
+| Shift+Left/Right | seek backward/forward 30s |
+| right-click | replace the tile under the cursor |
 | q | quit |
 
 ## Architecture

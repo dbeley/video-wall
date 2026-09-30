@@ -544,6 +544,9 @@ class VideoWindow:
         self._cell_h = 0
         self._tile_frame_size = 0
         self._wall: pygame.Surface | None = None
+        # Where the wall was last blitted: (off_x, off_y, dst_w, dst_h). Used to
+        # map a window-space mouse click back to a tile.
+        self._dst_rect: tuple[int, int, int, int] | None = None
         # Wall-clock frame budget: content advances at VIDEO_FPS regardless of
         # how fast the loop actually iterates.
         self._last_tick: float | None = None
@@ -795,10 +798,10 @@ class VideoWindow:
         if key == pygame.K_r:
             self._replace_tile(random.randrange(len(self._tiles)))
             return
-        if key == pygame.K_f:
+        if key == pygame.K_RIGHT:
             self._pending_seek = 30.0 if (mod & pygame.KMOD_SHIFT) else 10.0
             return
-        if key == pygame.K_b:
+        if key == pygame.K_LEFT:
             self._pending_seek = -30.0 if (mod & pygame.KMOD_SHIFT) else -10.0
             return
         idx = self._key_to_tile(key)
@@ -814,10 +817,34 @@ class VideoWindow:
         if pygame.K_1 <= key <= pygame.K_9:
             return key - pygame.K_1
         if key == pygame.K_0:
-            return MAX_TILES - 1
+            return 9
         if pygame.K_a <= key <= pygame.K_f:
-            return key - pygame.K_a + 9
+            return key - pygame.K_a + 10
         return None
+
+    def _handle_mouse(self, pos: tuple[int, int]) -> None:
+        """Replace the tile under a window-space click (if any)."""
+        if self._dst_rect is None or self._cols <= 0 or self._rows <= 0:
+            return
+        off_x, off_y, dst_w, dst_h = self._dst_rect
+        win_x, win_y = pos
+        if not (off_x <= win_x < off_x + dst_w and off_y <= win_y < off_y + dst_h):
+            return  # click landed in the letterbox bars
+        # Invert the fit-and-centre transform from _blit_frame.
+        wall_x = (win_x - off_x) * self.width / dst_w
+        wall_y = (win_y - off_y) * self.height / dst_h
+        stride_w = self._cell_w + self._border
+        stride_h = self._cell_h + self._border
+        if stride_w <= 0 or stride_h <= 0:
+            return
+        col = int(wall_x // stride_w)
+        row = int(wall_y // stride_h)
+        if not (0 <= col < self._cols and 0 <= row < self._rows):
+            return
+        idx = row * self._cols + col
+        if idx >= len(self._tiles):
+            return
+        self._replace_tile(idx)
 
     def _toggle_pause(self) -> None:
         if not self.paused:
@@ -911,12 +938,13 @@ class VideoWindow:
 
         print(
             "Controls:\n"
-            "  SPACE     = pause/resume\n"
-            "  r         = replace a random tile\n"
-            "  1-9, a-f  = replace specific tile (0=last, a=10..f=15)\n"
-            "  f/b       = seek +10s/-10s, then press a tile number\n"
-            "  Shift+f/b = seek +30s/-30s\n"
-            "  q         = quit\n",
+            "  SPACE        = pause/resume\n"
+            "  r            = replace a random tile\n"
+            "  1-9, 0, a-f  = replace specific tile (1-9=1-9, 0=10, a-f=11-16)\n"
+            "  Left/Right   = seek -10s/+10s, then press a tile key\n"
+            "  Shift+arrows = seek -30s/+30s\n"
+            "  right-click  = replace the tile under the cursor\n"
+            "  q            = quit\n",
             file=sys.stderr,
         )
 
@@ -928,6 +956,8 @@ class VideoWindow:
                         break
                     if event.type == pygame.KEYDOWN:
                         self._handle_key(event.key, event.mod)
+                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                        self._handle_mouse(event.pos)
 
                 if not self.running:
                     break
@@ -976,16 +1006,20 @@ class VideoWindow:
         """
         win_w, win_h = self.screen.get_size()
         if (win_w, win_h) == (self.width, self.height):
+            self._dst_rect = (0, 0, win_w, win_h)
             self.screen.blit(surface, (0, 0))
             return
 
         scale = min(win_w / self.width, win_h / self.height)
         dst_w = max(1, int(self.width * scale))
         dst_h = max(1, int(self.height * scale))
+        off_x = (win_w - dst_w) // 2
+        off_y = (win_h - dst_h) // 2
+        self._dst_rect = (off_x, off_y, dst_w, dst_h)
         self.screen.fill((0, 0, 0))
         self.screen.blit(
             pygame.transform.scale(surface, (dst_w, dst_h)),
-            ((win_w - dst_w) // 2, (win_h - dst_h) // 2),
+            (off_x, off_y),
         )
 
 
@@ -1001,12 +1035,13 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Keyboard controls (pygame window):\n"
-            "  SPACE       = pause/resume\n"
-            "  r           = replace a random tile\n"
-            "  1-9, a-f    = replace specific tile (0=last, a=10..f=15)\n"
-            "  f/F + tile  = seek forward 10s/30s\n"
-            "  b/B + tile  = seek backward 10s/30s\n"
-            "  q           = quit"
+            "  SPACE        = pause/resume\n"
+            "  r            = replace a random tile\n"
+            "  1-9, 0, a-f  = replace specific tile (1-9=1-9, 0=10, a-f=11-16)\n"
+            "  Left/Right   = seek -10s/+10s, then press a tile key\n"
+            "  Shift+arrows = seek -30s/+30s\n"
+            "  right-click  = replace the tile under the cursor\n"
+            "  q            = quit"
         ),
     )
     ap.add_argument("folder", type=Path, help="Folder with videos")
