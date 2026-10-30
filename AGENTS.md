@@ -50,21 +50,25 @@ per tile: ffmpeg (audio)              ──wav pipe─────▶ ffplay -n
 ```
 
 ### VideoWindow
-- `VideoWindow` owns the pygame window and one ffmpeg per tile, plus pygame compositing.
+- `VideoWindow(cfg, pool, start_pct, end_pct)` owns the pygame window, the tile list and one
+  ffmpeg per tile. One `PipelineConfig` is built in `main()` and reused: cfg.tiles is
+  mutated in place on replace/seek, so there is no config factory.
+- Per-tile runtime state lives in `TilePlayback` (procs, frame buffer, surface, audio clock)
+  — one object per tile instead of parallel lists.
 - Per-tile stdout pipes are non-blocking; `_pump_frames(due)` assembles whole frames and
   keeps the newest (drops stale) so a tile stays current.
 - `pygame.image.frombuffer()` converts each cell's raw RGB bytes to a surface; `_composite()`
-  blits cells into the wall surface; `_blit_frame()` scales the wall to the window.
+  blits cells into the wall surface; `_draw()` scales the wall to the window.
 - Keyboard events processed via `pygame.event.get()` — works when SDL window is focused.
 - Replacing/seeking a tile calls `_start_tile(i)` only, so other tiles are untouched.
 - Each tile's ffplay is SIGSTOPped at spawn and released on that tile's first frame
-  (`_release_tile_audio`).
+  (`_video_gate_open`).
 
 ### Models
-- `VideoMeta`, `HwAccelConfig`, `PipelineConfig`, `TileState` dataclasses.
-- `build_tile_video_cmd(cfg, i)` builds one tile's video ffmpeg argv, returns `(cmd, w, h)`.
+- `VideoMeta`, `HwAccelConfig`, `PipelineConfig`, `TileState`, `TilePlayback` dataclasses.
+- `build_tile_video_cmd(cfg, i)` builds one tile's video ffmpeg argv (just the argv).
 - `build_tile_audio_cmd(cfg, i)` builds one tile's audio ffmpeg argv (None if muted).
-- `_tile_filter_ops(cfg, tile)` generates the per-tile scale/pad/fps filter chain.
+- `tile_filter_chain(cfg, tile)` generates the per-tile scale/pad/fps filter chain.
 
 ## Implementation Notes & Tips
 - Subprocess: never use `shell=True`; always pass argv lists.
@@ -76,21 +80,21 @@ per tile: ffmpeg (audio)              ──wav pipe─────▶ ffplay -n
 - Display check: verifies `DISPLAY` or `WAYLAND_DISPLAY` is set before init.
 - Audio: one ffmpeg→ffplay per tile; the sound server mixes them. ffplay is gated on that
   tile's first frame, and the video is then held until ffplay's clock actually starts
-  (`_watch_audio_clock` → `_audio_started`). Without that hold, 4K/NFS audio seek latency
-  makes video lead audio by ~0.5 s. `AUDIO_START_TIMEOUT` prevents a permanently black tile
-  if audio fails.
+  (`_watch_audio_clock` → `TilePlayback.clock()`). Without that hold, 4K/NFS audio seek
+  latency makes video lead audio by ~0.5 s. `AUDIO_START_TIMEOUT` prevents a permanently
+  black tile if audio fails.
 - Frame pacing: ffplay's audio clock is the master. `_pump_frames` shows the frame whose
-  position matches `_audio_pos` and drops the rest, so a stall (tile restart, VAAPI hiccup)
-  cannot leave the video permanently behind the audio — the old pure wall-clock pacing did
-  exactly that (the 1 MB pipe only buffers ~2.7 cell frames, so lost time was never
-  recovered). Tiles with no live audio (`_audio_clock` returns None: muted, no track, or
-  ffplay stopped reporting for `AUDIO_CLOCK_STALE`) fall back to wall-clock pacing via
-  `elapsed * VIDEO_FPS` → `_frames_due`, capped by `MAX_CATCHUP_FRAMES`.
+  position matches the tile's clock and drops the rest, so a stall (tile restart, VAAPI
+  hiccup) cannot leave the video permanently behind the audio — the old pure wall-clock
+  pacing did exactly that (the 1 MB pipe only buffers ~2.7 cell frames, so lost time was
+  never recovered). Tiles with no live audio (`TilePlayback.clock()` returns None: muted,
+  no track, or ffplay stopped reporting for `AUDIO_CLOCK_STALE`) fall back to wall-clock
+  pacing via `_due_frames()`, capped by `MAX_CATCHUP_FRAMES`.
 - Pipe sizing: a raw cell frame is far larger than the 64 KB pipe default, so
-  `_start_tile` raises `F_SETPIPE_SZ`. Read a whole frame per pump, not one chunk.
+  `_widen_pipe` raises `F_SETPIPE_SZ`. Read a whole frame per pump, not one chunk.
 - Teardown: `kill_proc` uses SIGKILL — children are stateless and graceful waits made
   tile replacement feel slow.
-- Display scaling: `_blit_frame` scales to *fit* the window and centres with black
+- Display scaling: `_draw` scales to *fit* the window and centres with black
   bars, so tiling compositors (niri/sway) can't stretch the grid. Never
   `pygame.transform.scale` the frame straight to the window size.
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""video-wall — Single-window video wall with pygame viewer + audio."""
+"""video-wall — single-window video wall with pygame viewer and audio."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes.util
 import fcntl
 import glob
 import json
@@ -23,36 +24,40 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Suppress pygame compile-time warnings
+# Must be set before pygame is imported: silences its banner and the spurious
+# AVX2 warning some builds print.
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 warnings.filterwarnings("ignore", message=".*avx2.*", category=RuntimeWarning)
 
-import pygame  # noqa: E402 — late import after env setup
+import pygame  # late import: the environment above has to be set first
 
-MIN_FILE_SIZE = 50 * 1024  # 50 KB — skip torrent stubs / incomplete dls
+MIN_FILE_SIZE = 50 * 1024  # 50 KB — skips torrent stubs / partial downloads
 DEFAULT_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm")
 MAX_TILES = 16
 TITLE = "Video Wall"
 VIDEO_FPS = 30
-# Cap on frames discarded at once when catching up after a stall.
+# A tile that falls this far behind may drop more than one frame per loop tick.
 MAX_CATCHUP_FRAMES = 60
-# Max time to wait for a tile's audio to start playing before showing its video
-# anyway (keeps a broken/muted tile from staying black forever).
+# How long to hold a tile's picture while its audio starts, before giving up
+# and playing the video anyway (a broken audio pipeline must not stay black).
 AUDIO_START_TIMEOUT = 3.0
-# How long ffplay's audio clock may stop advancing before we stop treating it as
-# the video master clock (audio ended, ffplay died, stream stalled).
+# How long ffplay may go without reporting its clock before we stop trusting it
+# as the master clock (audio ended, ffplay died, stream stalled).
 AUDIO_CLOCK_STALE = 1.0
-# ffplay status line, e.g. "  12.34 M-A:  0.000 fd=...". The first number is
-# the master (audio) clock in seconds; `nan` lines don't match.
-_AUDIO_POS_RE = re.compile(rb"^\s*([-\d.]+)\s+M-A:")
+# ffplay status line, e.g. "  12.34 M-A:  0.000 fd=...". The leading number is
+# the audio clock in seconds; lines that have no clock yet show "nan" and fail
+# to match.
+AUDIO_POS_RE = re.compile(rb"^\s*([-\d.]+)\s+M-A:")
 
-
-def _pipe_max_size() -> int:
-    try:
-        with open("/proc/sys/fs/pipe-max-size") as fh:
-            return int(fh.read().strip())
-    except (OSError, ValueError):
-        return 1 << 20
+CONTROLS = (
+    "  SPACE        = pause/resume\n"
+    "  r            = replace a random tile\n"
+    "  1-9, 0, a-f  = replace specific tile (1-9=1-9, 0=10, a-f=11-16)\n"
+    "  Left/Right   = seek -10s/+10s, then press a tile key\n"
+    "  Shift+arrows = seek -30s/+30s\n"
+    "  right-click  = replace the tile under the cursor\n"
+    "  q            = quit"
+)
 
 
 # -------- Models --------
@@ -66,19 +71,23 @@ class VideoMeta:
     video_codec: str | None
 
 
-@dataclass
+@dataclass(frozen=True)
 class HwAccelConfig:
-    mode: str | None = None
-    global_opts: dict[str, str] = field(default_factory=dict)
+    """Hardware decode setup. ``mode is None`` means software decoding."""
 
-    @property
-    def enabled(self) -> bool:
-        return self.mode is not None
+    mode: str | None = None  # "cuda" | "vaapi" | None
+    vaapi_device: str | None = None
 
 
 @dataclass
 class PipelineConfig:
-    tiles: list["TileState"]
+    """Everything needed to build a tile's ffmpeg commands.
+
+    ``tiles`` is mutated in place when a tile is replaced or seeked, so one
+    config serves the whole run.
+    """
+
+    tiles: list[TileState]
     rows: int
     cols: int
     cell_w: int
@@ -88,7 +97,7 @@ class PipelineConfig:
     hwaccel: HwAccelConfig
     verbose: bool
     no_audio: bool
-    audio_mode: str
+    audio_mode: str  # "mix" | "one"
     audio_tile: int | None
     audio_rate: int
     border: int
@@ -97,6 +106,8 @@ class PipelineConfig:
 
 @dataclass
 class TileState:
+    """What a tile is playing: a file and a position in it."""
+
     path: Path
     seek: float
 
@@ -105,36 +116,90 @@ class TileState:
         return get_metadata(self.path)
 
 
-# -------- Caching & ffprobe --------
+@dataclass
+class TilePlayback:
+    """Runtime state of one tile: its decoders, frame buffer and audio clock."""
 
-_metadata_cache: dict[Path, VideoMeta] = {}
+    video: subprocess.Popen | None = None
+    buffer: bytearray = field(default_factory=bytearray)
+    surface: pygame.Surface | None = None
+    # Frames consumed since this tile (re)started, i.e. its content position.
+    frames_consumed: int = 0
+    # Latched once the audio gate has opened; the picture may be shown then.
+    video_ready: bool = False
+    audio_ffmpeg: subprocess.Popen | None = None
+    audio_player: subprocess.Popen | None = None
+    audio_held: bool = False  # ffplay is SIGSTOPped until the first frame
+    audio_released_at: float | None = None
+    audio_clock: float | None = None  # ffplay's position, in seconds
+    audio_clock_at: float | None = None  # when that position was reported
+
+    def clock(self) -> float | None:
+        """ffplay's audio position, or None when it is not live."""
+        if self.audio_clock is None or self.audio_clock_at is None:
+            return None
+        if time.monotonic() - self.audio_clock_at > AUDIO_CLOCK_STALE:
+            return None
+        return self.audio_clock
 
 
-def need(binname: str) -> None:
-    if not shutil.which(binname):
-        raise SystemExit(f"Missing '{binname}' in PATH.")
+# -------- Small helpers --------
+
+
+def require_tools(*names: str) -> None:
+    for name in names:
+        if shutil.which(name) is None:
+            raise SystemExit(f"Missing '{name}' in PATH.")
 
 
 def run_cmd(argv: list[str]) -> str:
+    """Run a command and return its output, or "" if it failed."""
     try:
         return subprocess.check_output(argv, stderr=subprocess.STDOUT).decode(
             "utf-8", "ignore"
         )
-    except subprocess.CalledProcessError as exc:
-        print(
-            f"[warn] command {' '.join(argv)} failed with code {exc.returncode}",
-            file=sys.stderr,
-        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"[warn] {' '.join(argv)} failed: {exc}", file=sys.stderr)
         return ""
-    except Exception as exc:
-        print(f"[warn] command {' '.join(argv)} failed: {exc}", file=sys.stderr)
-        return ""
+
+
+def pipe_max_size() -> int:
+    """Largest pipe size we are allowed to request (Linux)."""
+    try:
+        with open("/proc/sys/fs/pipe-max-size") as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return 1 << 20
+
+
+def kill_proc(proc: subprocess.Popen | None) -> None:
+    """SIGKILL a child decoder/player; they hold no state worth flushing."""
+    if proc is None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=0.2)
+
+
+def signal_proc(proc: subprocess.Popen | None, sig: int) -> None:
+    """Best-effort SIGSTOP/SIGCONT (the process may already be gone)."""
+    if proc is None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(proc.pid, sig)
+
+
+# -------- Metadata --------
+
+_metadata_cache: dict[Path, VideoMeta] = {}
 
 
 def get_metadata(path: Path) -> VideoMeta:
-    meta = _metadata_cache.get(path)
-    if meta is not None:
-        return meta
+    """Probe a file once and cache the result."""
+    cached = _metadata_cache.get(path)
+    if cached is not None:
+        return cached
 
     out = run_cmd(
         [
@@ -152,118 +217,112 @@ def get_metadata(path: Path) -> VideoMeta:
     duration: float | None = None
     has_audio = False
     has_video = False
-    vcodec: str | None = None
-    if out:
-        try:
-            data = json.loads(out)
-            fmt = data.get("format") or {}
-            dur_str = fmt.get("duration")
-            if dur_str:
-                duration = float(dur_str)
-            for s in data.get("streams") or []:
-                ctype = (s.get("codec_type") or "").lower()
-                if ctype == "audio":
-                    has_audio = True
-                if ctype == "video":
-                    has_video = True
-                    if vcodec is None:
-                        name = s.get("codec_name")
-                        if isinstance(name, str) and name:
-                            vcodec = name.lower()
-        except Exception as exc:
-            print(
-                f"[warn] failed to parse ffprobe output for {path}: {exc}",
-                file=sys.stderr,
-            )
+    video_codec: str | None = None
+    try:
+        data = json.loads(out) if out else {}
+        duration_text = (data.get("format") or {}).get("duration")
+        if duration_text:
+            duration = float(duration_text)
+        for stream in data.get("streams") or []:
+            kind = (stream.get("codec_type") or "").lower()
+            has_audio = has_audio or kind == "audio"
+            if kind == "video":
+                has_video = True
+                codec = stream.get("codec_name")
+                if video_codec is None and isinstance(codec, str):
+                    video_codec = codec.lower()
+    except (ValueError, TypeError, AttributeError) as exc:
+        print(f"[warn] cannot parse ffprobe output for {path}: {exc}", file=sys.stderr)
 
-    meta = VideoMeta(
-        duration=duration,
-        has_audio=has_audio,
-        has_video=has_video,
-        video_codec=vcodec,
-    )
+    meta = VideoMeta(duration, has_audio, has_video, video_codec)
     _metadata_cache[path] = meta
     return meta
 
 
 def is_valid_video(path: Path) -> bool:
-    """Cheap cached validity: returns True if ffprobe sees a video stream
-    AND the file is large enough (filters torrent stubs)."""
+    """Cached, cheap bail-out on stubs: needs a video stream and real bytes."""
+    if not get_metadata(path).has_video:
+        return False
     try:
-        if not get_metadata(path).has_video:
-            return False
-        # Skip suspiciously small files (incomplete torrents, stubs)
-        try:
-            if path.stat().st_size < MIN_FILE_SIZE:
-                return False
-        except OSError:
-            return False
-        return True
-    except Exception:
+        return path.stat().st_size >= MIN_FILE_SIZE
+    except OSError:
         return False
 
 
-# -------- Seek helpers --------
+# -------- Seeking --------
 
 
-def normalize_seek(path: Path, offset: float, loop: bool) -> float:
-    meta = get_metadata(path)
-    dur = meta.duration or 0.0
-    if dur > 0:
+def normalize_seek(path: Path, position: float, loop: bool) -> float:
+    """Clamp a seek into the file, wrapping around when looping."""
+    duration = get_metadata(path).duration or 0.0
+    if duration > 0:
         if loop:
-            offset = offset % dur
-        max_seek = max(0.0, dur - 3.0)
-        offset = min(offset, max_seek)
-    return max(0.0, offset)
+            position %= duration
+        position = min(position, max(0.0, duration - 3.0))
+    return max(0.0, position)
 
 
 def random_seek(path: Path, loop: bool, start_pct: float, end_pct: float) -> float:
-    dur = get_metadata(path).duration or 0.0
-    if dur <= 0:
+    duration = get_metadata(path).duration or 0.0
+    if duration <= 0:
         return 0.0
-    raw = random.uniform(start_pct, end_pct) * dur
-    return normalize_seek(path, raw, loop)
+    return normalize_seek(path, random.uniform(start_pct, end_pct) * duration, loop)
 
 
-# -------- Pool & grid --------
+# -------- Folder scan, validation, grid --------
+
+
+def scan_folder(folder: Path, exts: tuple[str, ...], recursive: bool) -> list[Path]:
+    wanted = set(exts)
+    if not recursive:
+        return [
+            path
+            for path in folder.iterdir()
+            if path.is_file() and path.suffix.lower() in wanted
+        ]
+    print(f"Scanning {folder} recursively...", file=sys.stderr, flush=True)
+    return [
+        Path(dirpath) / name
+        for dirpath, _, names in os.walk(folder)
+        for name in names
+        if Path(name).suffix.lower() in wanted
+    ]
 
 
 def pick_videos(
     pool: list[Path], count: int, exts: tuple[str, ...], seed: int | None
 ) -> list[Path]:
+    """Pick ``count`` distinct, playable videos, probing them in parallel."""
     if seed is not None:
         random.seed(seed)
-
     candidates = list(pool)
     random.shuffle(candidates)
-
-    def _validate(p: Path) -> tuple[Path, bool]:
-        return p, is_valid_video(p)
 
     selected: list[Path] = []
     checked = 0
     workers = min(8, len(candidates))
-    with ThreadPoolExecutor(max_workers=workers) as pool_exec:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            pool_exec.submit(_validate, p): p
-            for p in candidates[:min(len(candidates), count * 20)]
+            executor.submit(is_valid_video, path): path
+            for path in candidates[: count * 20]
         }
-        for fut in as_completed(futures):
-            p, ok = fut.result()
+        for future in as_completed(futures):
             checked += 1
-            if checked % 5 == 0 or checked <= count:
+            if checked % 5 == 0:
                 print(
                     f"\rValidating: {checked}/{len(futures)} checked, "
                     f"{len(selected)}/{count} found",
-                    end="", file=sys.stderr, flush=True,
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
                 )
-            if ok:
-                selected.append(p)
+            if future.result():
+                selected.append(futures[future])
                 if len(selected) >= count:
-                    pool_exec.shutdown(wait=False, cancel_futures=True)
+                    # Leave the remaining probes queued but unfinished.
+                    executor.shutdown(wait=False, cancel_futures=True)
                     break
-
-    print(file=sys.stderr)  # newline after progress
+    print(file=sys.stderr)  # end the progress line
 
     if len(selected) < count:
         raise SystemExit(
@@ -273,44 +332,44 @@ def pick_videos(
     return selected
 
 
-def parse_grid(grid_str: str | None) -> tuple[int, int] | None:
-    """Parse 'NxM' grid string. Returns (rows, cols) or None."""
-    if not grid_str:
+def parse_grid(text: str | None) -> tuple[int, int] | None:
+    """Parse an ``NxM`` layout into (rows, cols), or None when not given."""
+    if not text:
         return None
-    parts = grid_str.lower().split("x")
-    if len(parts) != 2:
-        raise SystemExit(f"Invalid grid format '{grid_str}' — use NxM (e.g. 3x3, 2x4).")
     try:
-        r, c = int(parts[0]), int(parts[1])
+        rows_text, cols_text = text.lower().split("x")
+        rows, cols = int(rows_text), int(cols_text)
     except ValueError:
-        raise SystemExit(f"Invalid grid format '{grid_str}' — use NxM (e.g. 3x3, 2x4).")
-    if r < 1 or c < 1:
+        raise SystemExit(f"Invalid grid '{text}' — use NxM (e.g. 3x3, 2x4).") from None
+    if rows < 1 or cols < 1:
         raise SystemExit("Grid rows and columns must be at least 1.")
-    if r * c > MAX_TILES:
-        raise SystemExit(f"Grid {r}x{c} = {r*c} tiles exceeds max {MAX_TILES}.")
-    return r, c
+    if rows * cols > MAX_TILES:
+        raise SystemExit(f"Grid {rows}x{cols} exceeds the {MAX_TILES}-tile maximum.")
+    return rows, cols
 
 
-def compute_grid(n: int, grid: tuple[int, int] | None) -> tuple[int, int]:
-    """Compute (rows, cols) for n tiles. If grid is given, use it explicitly."""
+def compute_grid(count: int, grid: tuple[int, int] | None) -> tuple[int, int]:
+    """(rows, cols) for ``count`` tiles: the given grid, else as square as possible."""
     if grid:
         return grid
-    cols = math.ceil(math.sqrt(n))
-    rows = math.ceil(n / cols)
-    return rows, cols
+    cols = math.ceil(math.sqrt(count))
+    return math.ceil(count / cols), cols
 
 
 # -------- Hardware acceleration --------
 
+# Codecs whose frames must stay in software: the hardware scale filters
+# cannot consume them.
+SOFTWARE_ONLY_CODECS = {"mpeg4", "msmpeg4v3", "mpeg1video"}
+
 
 def list_hwaccels() -> set[str]:
     out = run_cmd(["ffmpeg", "-hide_banner", "-hwaccels"])
-    accels: set[str] = set()
-    for line in out.splitlines():
-        s = line.strip().lower()
-        if s and not s.startswith("hardware acceleration"):
-            accels.add(s)
-    return accels
+    return {
+        line.strip().lower()
+        for line in out.splitlines()
+        if line.strip() and not line.lower().startswith("hardware acceleration")
+    }
 
 
 def find_vaapi_device() -> str | None:
@@ -320,140 +379,119 @@ def find_vaapi_device() -> str | None:
     return None
 
 
-def _cuda_runtime_available() -> bool:
-    try:
-        import ctypes.util
-
-        return ctypes.util.find_library("cuda") is not None
-    except Exception:
-        return False
+def cuda_runtime_available() -> bool:
+    return ctypes.util.find_library("cuda") is not None
 
 
-def choose_hwaccel(pref: str | None = None) -> HwAccelConfig:
-    if pref and pref.lower() in ("off", "none"):
+def choose_hwaccel(preference: str | None) -> HwAccelConfig:
+    """Resolve ``--hwaccel`` against what this machine actually supports."""
+    preference = (preference or "auto").lower()
+    if preference in ("off", "none"):
         return HwAccelConfig()
 
-    p = (pref or "auto").lower()
+    cuda = HwAccelConfig(mode="cuda")
+    vaapi = HwAccelConfig(mode="vaapi", vaapi_device=find_vaapi_device())
 
-    if p == "cuda":
-        if _cuda_runtime_available():
-            return HwAccelConfig(mode="cuda")
+    if preference == "cuda":
+        if cuda_runtime_available():
+            return cuda
+        print("[warn] --hwaccel cuda: no CUDA runtime, using software", file=sys.stderr)
+        return HwAccelConfig()
+    if preference == "vaapi":
+        if vaapi.vaapi_device:
+            return vaapi
         print(
-            "[warn] --hwaccel cuda: CUDA runtime not available, "
-            "falling back to software",
+            "[warn] --hwaccel vaapi: no VAAPI render node, using software",
             file=sys.stderr,
         )
         return HwAccelConfig()
 
-    if p == "vaapi":
-        dev = find_vaapi_device()
-        if dev:
-            return HwAccelConfig(mode="vaapi", global_opts={"-vaapi_device": dev})
-        print(
-            "[warn] --hwaccel vaapi: no VAAPI render node found",
-            file=sys.stderr,
-        )
-        return HwAccelConfig()
-
-    accels = list_hwaccels()
-    if "cuda" in accels and _cuda_runtime_available():
-        return HwAccelConfig(mode="cuda")
-    if "vaapi" in accels:
-        dev = find_vaapi_device()
-        if dev:
-            return HwAccelConfig(mode="vaapi", global_opts={"-vaapi_device": dev})
+    available = list_hwaccels()
+    if "cuda" in available and cuda_runtime_available():
+        return cuda
+    if "vaapi" in available and vaapi.vaapi_device:
+        return vaapi
     return HwAccelConfig()
+
+
+def hw_mode(cfg: PipelineConfig, tile: TileState) -> str | None:
+    """Hardware decode mode usable for this tile (None means software)."""
+    if cfg.hwaccel.mode is None:
+        return None
+    if (tile.metadata.video_codec or "").lower() in SOFTWARE_ONLY_CODECS:
+        return None
+    return cfg.hwaccel.mode
 
 
 # -------- ffmpeg command builders --------
 
-# Codecs for which hardware decode is skipped (hardware scale filter would then
-# be applied to software frames and fail).
-_SOFTWARE_ONLY_CODECS = {"mpeg4", "msmpeg4v3", "mpeg1video"}
 
-
-def _wants_hw(cfg: PipelineConfig, tile: TileState) -> bool:
-    codec = (tile.metadata.video_codec or "").lower()
-    return cfg.hwaccel.enabled and codec not in _SOFTWARE_ONLY_CODECS
-
-
-def _tile_filter_ops(cfg: PipelineConfig, tile: TileState) -> list[str]:
-    """Per-tile scale/pad/fps chain: fill the cell, preserve aspect, black bars."""
-    ops: list[str] = []
-
-    if _wants_hw(cfg, tile) and cfg.hwaccel.mode == "cuda":
-        ops.append(
+def tile_filter_chain(cfg: PipelineConfig, tile: TileState) -> list[str]:
+    """Fill the cell, keep the aspect ratio (black bars), force ``VIDEO_FPS``."""
+    mode = hw_mode(cfg, tile)
+    if mode == "cuda":
+        scale = (
             f"scale_cuda={cfg.cell_w}:{cfg.cell_h}:"
             f"force_original_aspect_ratio=decrease"
         )
-        ops += ["hwdownload", "format=nv12"]
-    elif _wants_hw(cfg, tile) and cfg.hwaccel.mode == "vaapi":
-        ops.append(
+        ops = [scale, "hwdownload", "format=nv12"]
+    elif mode == "vaapi":
+        scale = (
             f"scale_vaapi=w={cfg.cell_w}:h={cfg.cell_h}:"
             f"force_original_aspect_ratio=decrease"
         )
-        ops += ["hwdownload", "format=nv12"]
+        ops = [scale, "hwdownload", "format=nv12"]
     else:
-        ops.append(
-            f"scale={cfg.cell_w}:{cfg.cell_h}:"
-            f"force_original_aspect_ratio=decrease"
-        )
-
-    ops.append(f"pad={cfg.cell_w}:{cfg.cell_h}:(ow-iw)/2:(oh-ih)/2:black")
-    ops.append("format=yuv420p")
-    ops.append(f"fps={VIDEO_FPS}")
+        ops = [
+            f"scale={cfg.cell_w}:{cfg.cell_h}:force_original_aspect_ratio=decrease"
+        ]
+    ops += [
+        f"pad={cfg.cell_w}:{cfg.cell_h}:(ow-iw)/2:(oh-ih)/2:black",
+        "format=yuv420p",
+        f"fps={VIDEO_FPS}",
+    ]
     return ops
 
 
-def build_tile_video_cmd(cfg: PipelineConfig, index: int) -> tuple[list[str], int, int]:
-    """ffmpeg command for ONE tile: cell-sized raw RGB frames to stdout.
+def build_tile_video_cmd(cfg: PipelineConfig, index: int) -> list[str]:
+    """ffmpeg argv for one tile: cell-sized raw RGB24 frames on stdout.
 
-    One process per tile means replacing/seeking a tile never touches the
-    other tiles' decoders (no whole-wall restart, no playback reset).
+    One process per tile, so replacing or seeking a tile never touches the
+    other tiles' decoders.
     """
     tile = cfg.tiles[index]
-
-    args = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "info" if cfg.verbose else "error",
-    ]
-    for k, v in cfg.hwaccel.global_opts.items():
-        args += [k, v]
-
+    args = ["ffmpeg", "-hide_banner", "-loglevel", "info" if cfg.verbose else "error"]
+    if cfg.hwaccel.vaapi_device:
+        args += ["-vaapi_device", cfg.hwaccel.vaapi_device]
     if cfg.loop:
         args += ["-stream_loop", "-1"]
-    if _wants_hw(cfg, tile) and cfg.hwaccel.mode == "cuda":
-        args += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-    elif _wants_hw(cfg, tile) and cfg.hwaccel.mode == "vaapi":
-        args += ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"]
-
+    mode = hw_mode(cfg, tile)
+    if mode:
+        args += ["-hwaccel", mode, "-hwaccel_output_format", mode]
     args += ["-ss", f"{tile.seek:.3f}", "-i", str(tile.path.absolute())]
-    args += ["-an", "-vf", ",".join(_tile_filter_ops(cfg, tile))]
+    args += ["-an", "-vf", ",".join(tile_filter_chain(cfg, tile))]
     args += ["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
-    return args, cfg.cell_w, cfg.cell_h
+    return args
 
 
 def build_tile_audio_cmd(cfg: PipelineConfig, index: int) -> list[str] | None:
-    """ffmpeg command for ONE tile's audio → WAV to stdout (None when muted).
+    """ffmpeg argv for one tile's audio → WAV on stdout, or None when muted.
 
-    Each tile gets its own ffmpeg→ffplay chain, so changing a tile restarts
-    only that tile's audio and the others keep playing. The OS/sound server
-    mixes the per-tile streams (``--volume`` is applied per stream).
+    Each tile owns its ffmpeg→ffplay chain, so replacing a tile restarts only
+    that tile's audio. The sound server mixes the per-tile streams, which is
+    where ``--volume`` is applied.
     """
     if cfg.no_audio:
         return None
     tile = cfg.tiles[index]
     if not tile.metadata.has_audio:
         return None
-
     if cfg.audio_mode == "one":
         with_audio = [i for i, t in enumerate(cfg.tiles) if t.metadata.has_audio]
+        # Fall back to the first audible tile if --audio-tile is out of range.
         chosen = cfg.audio_tile if cfg.audio_tile in with_audio else with_audio[0]
         if index != chosen:
             return None
-
     return [
         "ffmpeg",
         "-hide_banner",
@@ -468,804 +506,560 @@ def build_tile_audio_cmd(cfg: PipelineConfig, index: int) -> list[str] | None:
     ]
 
 
-# -------- Kill helper --------
+# -------- Keyboard mapping --------
 
 
-def kill_proc(p: subprocess.Popen | None) -> None:
-    """Immediately tear down a child decoder/player (stateless, so SIGKILL)."""
-    if p is None:
-        return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        p.kill()
-    with contextlib.suppress(Exception):
-        p.wait(timeout=0.2)
-
-
-def signal_proc(p: subprocess.Popen | None, sig: int) -> None:
-    """Best-effort delivery of SIGSTOP/SIGCONT (process may already be gone)."""
-    if p is None:
-        return
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.kill(p.pid, sig)
+def tile_index_for_key(key: int) -> int | None:
+    """Map 1-9, 0, a-f to tile indexes 0-15."""
+    if pygame.K_1 <= key <= pygame.K_9:
+        return key - pygame.K_1
+    if key == pygame.K_0:
+        return 9
+    if pygame.K_a <= key <= pygame.K_f:
+        return key - pygame.K_a + 10
+    return None
 
 
 # -------- Pygame viewer --------
 
 
 class VideoWindow:
-    """Pygame window displaying raw RGB frames from ffmpeg.
+    """Single pygame window compositing one decoder per tile.
 
-    Two independent pipelines:
-      - Video: ffmpeg → rawvideo pipe → pygame display
-      - Audio: ffmpeg → WAV pipe → ffplay -nodisp (when not --no-audio)
+    Per tile:
+      video: ffmpeg → raw RGB frames → pygame surface
+      audio: ffmpeg → WAV → ffplay -nodisp (the sound server mixes the tiles)
 
-    Audio ffplay is started BEFORE video ffmpeg so pipes are ready.
-    The window stays open across tile replacements.
+    The window and the other tiles survive a tile replacement.
     """
 
     def __init__(
-        self,
-        width: int,
-        height: int,
-        fullscreen: bool = False,
-        verbose: bool = False,
+        self, cfg: PipelineConfig, pool: list[Path], start_pct: float, end_pct: float
     ):
-        pygame.display.init()
-        pygame.key.set_repeat(300, 80)
-
-        flags = pygame.FULLSCREEN | pygame.SCALED if fullscreen else 0
-        self.screen = pygame.display.set_mode((width, height), flags)
-        pygame.display.set_caption(TITLE)
-        if fullscreen:
-            pygame.mouse.set_visible(False)
-
-        self.width = width
-        self.height = height
-        self.verbose = verbose
+        self.cfg = cfg
+        self.pool = pool
+        self.start_pct = start_pct
+        self.end_pct = end_pct
+        self.banned: set[Path] = set()  # files that crashed a decoder
         self.running = False
         self.paused = False
 
-        self._pending_seek: float | None = None
-        self._clock = pygame.time.Clock()
+        self.wall_w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
+        self.wall_h = cfg.rows * (cfg.cell_h + cfg.border) - cfg.border
+        self.frame_size = cfg.cell_w * cfg.cell_h * 3
 
-        # One decoder per tile, composited by pygame. These lists mirror
-        # len(self._tiles) and let a replace/seek touch only one tile.
-        self._vid_procs: list[subprocess.Popen | None] = []
-        self._vid_bufs: list[bytearray] = []
-        self._tile_surfaces: list[pygame.Surface | None] = []
-        self._aud_ffmpeg: list[subprocess.Popen | None] = []
-        self._aud_ffplay: list[subprocess.Popen | None] = []
-        self._audio_gated: list[bool] = []  # per-tile: audio held for first frame
-        self._audio_started: list[bool] = []  # per-tile: ffplay clock is running
-        self._audio_pos: list[float | None] = []  # per-tile ffplay clock (s)
-        self._audio_pos_wall: list[float | None] = []  # when the clock was last seen
-        self._audio_release_wall: list[float | None] = []
-        self._tile_pos: list[int] = []  # per-tile: frames consumed since (re)start
-        self._vid_allowed: list[bool] = []  # per-tile: may present video
-        self._rows = 0
-        self._cols = 0
-        self._border = 0
-        self._cell_w = 0
-        self._cell_h = 0
-        self._tile_frame_size = 0
-        self._wall: pygame.Surface | None = None
+        pygame.display.init()
+        pygame.key.set_repeat(300, 80)
+        flags = pygame.FULLSCREEN | pygame.SCALED if cfg.fullscreen else 0
+        self.screen = pygame.display.set_mode((self.wall_w, self.wall_h), flags)
+        pygame.display.set_caption(TITLE)
+        if cfg.fullscreen:
+            pygame.mouse.set_visible(False)
+
+        self.wall = pygame.Surface((self.wall_w, self.wall_h))
         # Where the wall was last blitted: (off_x, off_y, dst_w, dst_h). Used to
         # map a window-space mouse click back to a tile.
-        self._dst_rect: tuple[int, int, int, int] | None = None
-        # Wall-clock frame budget: content advances at VIDEO_FPS regardless of
-        # how fast the loop actually iterates.
+        self.dst_rect: tuple[int, int, int, int] | None = None
+
+        self.playback = [TilePlayback() for _ in cfg.tiles]
+        self._pending_seek: float | None = None
+        self._clock = pygame.time.Clock()
+        # Wall-clock frame budget, for tiles that have no audio to follow.
         self._last_tick: float | None = None
         self._frames_due = 0.0
 
-        # External state
-        self._tiles: list[TileState] = []
-        self._pool: list[Path] = []
-        self._banned: set[Path] = set()  # paths that caused crashes
-        self._start_pct = 0.5
-        self._end_pct = 0.75
-        self._loop = False
-        self._make_cfg = None
-
-    # ----- Per-tile pipelines -----
-
-    def _cfg(self) -> PipelineConfig:
-        return self._make_cfg(self._tiles)
+    # ----- Tile lifecycle -----
 
     def _start_tile(self, index: int) -> None:
-        """(Re)start video + audio for a single tile only."""
-        cfg = self._cfg()
-        self._stop_tile_video(index)
-        self._stop_tile_audio(index)
-
-        vid_cmd, _, _ = build_tile_video_cmd(cfg, index)
-        proc = subprocess.Popen(
-            vid_cmd,
-            stdout=subprocess.PIPE,
-            stderr=None if self.verbose else subprocess.DEVNULL,
-        )
-        if proc.stdout is not None:
-            fd = proc.stdout.fileno()
-            # A raw frame (e.g. 480x270x3 = 388 KB) is far bigger than the
-            # default 64 KB pipe; grow it so a whole frame can be buffered and
-            # read without stalling the loop.
-            want = max(self._tile_frame_size * 4, 1 << 20)
-            setpipesz = getattr(fcntl, "F_SETPIPE_SZ", None)
-            if setpipesz is not None:
-                with contextlib.suppress(OSError, ValueError):
-                    fcntl.fcntl(fd, setpipesz, min(want, _pipe_max_size()))
-            with contextlib.suppress(OSError, ValueError):
-                os.set_blocking(fd, False)
-        self._vid_procs[index] = proc
-        self._vid_bufs[index] = bytearray()
-        self._tile_surfaces[index] = None
-        self._audio_started[index] = False
-        self._audio_pos[index] = None
-        self._audio_pos_wall[index] = None
-        self._audio_release_wall[index] = None
-        self._tile_pos[index] = 0
-
-        aud_cmd = build_tile_audio_cmd(cfg, index)
-        self._vid_allowed[index] = aud_cmd is None
-        if aud_cmd:
-            self._start_tile_audio(index, aud_cmd)
-
+        """(Re)start one tile's decoders; every other tile keeps playing."""
+        self._stop_playback(self.playback[index])
+        tile = TilePlayback()
+        self.playback[index] = tile
+        self._spawn_video(tile, index)
+        self._spawn_audio(tile, index)
         if self.paused:
-            signal_proc(proc, signal.SIGSTOP)
-            signal_proc(self._aud_ffmpeg[index], signal.SIGSTOP)
+            signal_proc(tile.video, signal.SIGSTOP)
+            signal_proc(tile.audio_ffmpeg, signal.SIGSTOP)
 
-    def _stop_tile_video(self, index: int) -> None:
-        kill_proc(self._vid_procs[index])
-        self._vid_procs[index] = None
+    def _stop_playback(self, tile: TilePlayback) -> None:
+        kill_proc(tile.video)
+        kill_proc(tile.audio_ffmpeg)
+        kill_proc(tile.audio_player)
+        tile.video = tile.audio_ffmpeg = tile.audio_player = None
 
-    def _start_tile_audio(self, index: int, cmd: list[str]) -> None:
-        if not shutil.which("ffplay"):
-            if self.verbose:
-                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
-            self._vid_allowed[index] = True
+    def _spawn_video(self, tile: TilePlayback, index: int) -> None:
+        tile.video = subprocess.Popen(
+            build_tile_video_cmd(self.cfg, index),
+            stdout=subprocess.PIPE,
+            stderr=None if self.cfg.verbose else subprocess.DEVNULL,
+        )
+        self._widen_pipe(tile.video)
+
+    def _widen_pipe(self, video: subprocess.Popen) -> None:
+        """Grow the pipe so it can hold a few whole frames (default is 64 KB)."""
+        if video.stdout is None:
             return
-        # ffplay first (reader), held until this tile's first video frame; then
-        # we wait for its clock to actually start before showing the video.
-        ffplay = subprocess.Popen(
+        fd = video.stdout.fileno()
+        size = min(max(self.frame_size * 4, 1 << 20), pipe_max_size())
+        set_pipe_size = getattr(fcntl, "F_SETPIPE_SZ", None)
+        if set_pipe_size is not None:
+            with contextlib.suppress(OSError, ValueError):
+                fcntl.fcntl(fd, set_pipe_size, size)
+        with contextlib.suppress(OSError, ValueError):
+            os.set_blocking(fd, False)
+
+    def _spawn_audio(self, tile: TilePlayback, index: int) -> None:
+        command = build_tile_audio_cmd(self.cfg, index)
+        if command is None:
+            tile.video_ready = True
+            return
+        if shutil.which("ffplay") is None:
+            if self.cfg.verbose:
+                print("[warn] ffplay not found — audio disabled", file=sys.stderr)
+            tile.video_ready = True
+            return
+        # ffplay first (it reads the pipe), held until this tile's first frame
+        # arrives; the video then waits for its clock, see _video_gate_open.
+        player = subprocess.Popen(
             [
                 "ffplay", "-nodisp", "-vn",
-                # info level so the status line (audio clock) is emitted.
+                # info level is what emits the status line (the audio clock)
                 "-loglevel", "info",
                 "-autoexit", "-i", "pipe:0",
             ],
             stdin=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        self._aud_ffplay[index] = ffplay
-        self._audio_started[index] = False
-        signal_proc(ffplay, signal.SIGSTOP)
-        self._audio_gated[index] = ffplay.poll() is None
+        tile.audio_player = player
+        # Hold ffplay until this tile has a frame to show (unless it died
+        # instantly, in which case there is nothing to hold).
+        tile.audio_held = player.poll() is None
+        signal_proc(player, signal.SIGSTOP)
         threading.Thread(
-            target=self._watch_audio_clock, args=(index, ffplay), daemon=True
+            target=self._watch_audio_clock, args=(tile, player), daemon=True
         ).start()
-        # ffmpeg second (writes into ffplay stdin)
-        self._aud_ffmpeg[index] = subprocess.Popen(cmd, stdout=ffplay.stdin)
+        # ffmpeg second: it writes into ffplay's stdin.
+        tile.audio_ffmpeg = subprocess.Popen(command, stdout=player.stdin)
 
-    def _watch_audio_clock(self, index: int, proc: subprocess.Popen) -> None:
-        """Set ``_audio_started[index]`` when ffplay reports it is playing."""
-        if proc.stderr is None:
+    def _watch_audio_clock(self, tile: TilePlayback, player: subprocess.Popen) -> None:
+        r"""Track ffplay's status line, which carries the audio clock.
+
+        The line is ``\r``-terminated, so lines are split by hand.
+        """
+        if player.stderr is None:
             return
-        fd = proc.stderr.fileno()
+        fd = player.stderr.fileno()
         pending = b""
         while True:
             try:
                 chunk = os.read(fd, 4096)
             except OSError:
-                break
+                return
             if not chunk:
-                break
+                return
             pending += chunk
-            parts = re.split(rb"[\r\n]", pending)
-            pending = parts.pop()
-            for line in parts:
-                m = _AUDIO_POS_RE.match(line)
-                if m and self._aud_ffplay[index] is proc:
-                    self._audio_pos[index] = float(m.group(1))
-                    self._audio_pos_wall[index] = time.monotonic()
-                    self._audio_started[index] = True
+            *lines, pending = re.split(rb"[\r\n]", pending)
+            for line in lines:
+                match = AUDIO_POS_RE.match(line)
+                if match:
+                    tile.audio_clock = float(match.group(1))
+                    tile.audio_clock_at = time.monotonic()
 
-    def _release_tile_audio(self, index: int) -> None:
-        if index < len(self._audio_gated) and self._audio_gated[index]:
-            self._audio_gated[index] = False
-            self._audio_release_wall[index] = time.monotonic()
-            signal_proc(self._aud_ffplay[index], signal.SIGCONT)
+    # ----- A/V sync -----
 
-    def _audio_timed_out(self, index: int) -> bool:
-        released = self._audio_release_wall[index]
-        return released is not None and time.monotonic() - released > AUDIO_START_TIMEOUT
+    def _video_gate_open(self, tile: TilePlayback) -> bool:
+        """Hold a new tile's picture until its audio is actually playing.
 
-    def _audio_clock(self, index: int) -> float | None:
-        """Audio position (s) for use as the A/V master clock, or None.
-
-        Returns None when the tile has no audio, or when ffplay stopped
-        reporting (stream ended, process died), so the caller falls back to
-        wall-clock pacing for that tile.
+        An audio seek can be slow (4K on NFS). Starting the video first would
+        leave it permanently ahead of the soundtrack.
         """
-        pos = self._audio_pos[index]
-        seen = self._audio_pos_wall[index]
-        if pos is None or seen is None:
-            return None
-        if time.monotonic() - seen > AUDIO_CLOCK_STALE:
-            return None
-        return pos
+        if len(tile.buffer) < self.frame_size:
+            self._read_frames(tile, self.frame_size)
+            if len(tile.buffer) < self.frame_size:
+                return False
+        if tile.audio_released_at is None:
+            tile.audio_released_at = time.monotonic()
+        if tile.audio_held:
+            tile.audio_held = False
+            signal_proc(tile.audio_player, signal.SIGCONT)
+            return False
+        if tile.clock() is None and not self._audio_timed_out(tile):
+            return False
+        tile.video_ready = True
+        return True
 
-    def _stop_tile_audio(self, index: int) -> None:
-        kill_proc(self._aud_ffmpeg[index])
-        kill_proc(self._aud_ffplay[index])
-        self._aud_ffmpeg[index] = None
-        self._aud_ffplay[index] = None
-        self._audio_gated[index] = False
-        self._audio_started[index] = False
-        self._audio_pos[index] = None
-        self._audio_pos_wall[index] = None
-        self._audio_release_wall[index] = None
-
-    def _stop_procs(self) -> None:
-        for i in range(len(self._vid_procs)):
-            self._stop_tile_video(i)
-            self._stop_tile_audio(i)
-
-    def _start_all(self) -> None:
-        """Build all tile decoders for the current grid."""
-        cfg = self._cfg()
-        self._rows, self._cols = cfg.rows, cfg.cols
-        self._cell_w, self._cell_h = cfg.cell_w, cfg.cell_h
-        self._border = cfg.border
-
-        w = cfg.cols * (cfg.cell_w + cfg.border) - cfg.border
-        h = cfg.rows * (cfg.cell_h + cfg.border) - cfg.border
-        if (w, h) != (self.width, self.height):
-            self.width, self.height = w, h
-            self.screen = pygame.display.set_mode((w, h), self.screen.get_flags())
-        self._tile_frame_size = cfg.cell_w * cfg.cell_h * 3
-        self._wall = pygame.Surface((w, h))
-
-        n = len(self._tiles)
-        self._vid_procs = [None] * n
-        self._vid_bufs = [bytearray() for _ in range(n)]
-        self._tile_surfaces = [None] * n
-        self._aud_ffmpeg = [None] * n
-        self._aud_ffplay = [None] * n
-        self._audio_gated = [False] * n
-        self._audio_started = [False] * n
-        self._audio_pos = [None] * n
-        self._audio_pos_wall = [None] * n
-        self._audio_release_wall = [None] * n
-        self._tile_pos = [0] * n
-        self._vid_allowed = [True] * n
-        for i in range(n):
-            self._start_tile(i)
+    def _audio_timed_out(self, tile: TilePlayback) -> bool:
+        released = tile.audio_released_at
+        return released is not None and time.monotonic() - released > AUDIO_START_TIMEOUT
 
     def _pump_frames(self, due: int) -> None:
         """Advance every tile to the frame it should be showing *now*.
 
-        Pacing has two masters:
-
-        * A tile with live audio follows ffplay's audio clock. The frame whose
-          content position matches what is being heard is shown and the frames
-          in between are dropped. This is what keeps A/V in sync: a loop stall
-          or a tile restart can lose video frames, but it cannot make the video
-          drift behind the soundtrack, because the target is absolute.
-        * A tile without audio (muted, no audio track, or ffplay gone) falls
-          back to the wall clock (``due``, see ``run``), which advances content
-          at ``VIDEO_FPS`` even if the loop iterates faster or slower.
+        A tile with live audio follows ffplay's audio clock and drops the
+        frames in between, so a stall (tile restart, slow seek) cannot leave
+        the picture permanently behind the soundtrack. A tile without audio is
+        paced by the wall clock, ``due`` frames per call.
         """
-        fs = self._tile_frame_size
-        for i, proc in enumerate(self._vid_procs):
-            if proc is None or proc.stdout is None or proc.poll() is not None:
+        for tile in self.playback:
+            if tile.video is None or tile.video.poll() is not None:
                 continue
-            fd = proc.stdout.fileno()
-            buf = self._vid_bufs[i]
-
-            if not self._vid_allowed[i]:
-                # Hold this tile's video until its audio pipeline is actually
-                # playing (its seek can take a while on 4K/NFS), otherwise the
-                # video would start first and stay ahead of the audio.
-                while len(buf) < fs:
-                    try:
-                        data = os.read(fd, fs - len(buf))
-                    except (BlockingIOError, InterruptedError, OSError):
-                        break
-                    if not data:
-                        break
-                    buf += data
-                if len(buf) < fs:
-                    continue
-                if self._audio_release_wall[i] is None:
-                    self._audio_release_wall[i] = time.monotonic()
-                if self._audio_gated[i]:
-                    self._release_tile_audio(i)
-                    continue
-                if not self._audio_started[i] and not self._audio_timed_out(i):
-                    continue
-                self._vid_allowed[i] = True
-
-            clock = self._audio_clock(i)
-            if clock is not None:
-                target = int(clock * VIDEO_FPS)
-                if target < self._tile_pos[i]:
-                    # Audio is behind the frame already on screen (restart
-                    # after an audio timeout, or clock jitter): wait for it.
-                    continue
-                want = (target - self._tile_pos[i] + 1) * fs
-            else:
-                if due <= 0:
-                    continue
-                want = due * fs
-
-            while len(buf) < want:
-                try:
-                    # Cap each read so a large catch-up can't allocate a huge
-                    # temporary buffer in one go.
-                    data = os.read(fd, min(want - len(buf), fs * 8))
-                except (BlockingIOError, InterruptedError, OSError):
-                    break
-                if not data:
-                    break
-                buf += data
-
-            if len(buf) < fs:
+            if not tile.video_ready and not self._video_gate_open(tile):
                 continue
-            avail = len(buf) // fs
-            self._tile_pos[i] += avail
-            # Present the newest available frame, drop the rest (catch-up).
-            frame = bytes(buf[(avail - 1) * fs: avail * fs])
-            del buf[: avail * fs]
-            self._tile_surfaces[i] = pygame.image.frombuffer(
-                frame, (self._cell_w, self._cell_h), "RGB"
-            )
+            self._present_frame(tile, due)
+
+    def _present_frame(self, tile: TilePlayback, due: int) -> None:
+        clock = tile.clock()
+        if clock is None:
+            if due <= 0:
+                return
+            want = due * self.frame_size
+        else:
+            target = int(clock * VIDEO_FPS)
+            if target < tile.frames_consumed:
+                # The clock is behind the frame on screen (just after an audio
+                # timeout, or clock jitter): wait for the audio to catch up.
+                return
+            want = (target - tile.frames_consumed + 1) * self.frame_size
+
+        self._read_frames(tile, want)
+        available = len(tile.buffer) // self.frame_size
+        if available == 0:
+            return
+        # Show the newest frame available and drop the older ones (catch-up).
+        tile.frames_consumed += available
+        start = (available - 1) * self.frame_size
+        frame = bytes(tile.buffer[start : start + self.frame_size])
+        del tile.buffer[: available * self.frame_size]
+        tile.surface = pygame.image.frombuffer(
+            frame, (self.cfg.cell_w, self.cfg.cell_h), "RGB"
+        )
+
+    def _read_frames(self, tile: TilePlayback, want: int) -> None:
+        """Read until ``want`` bytes are buffered or the pipe runs dry."""
+        if tile.video is None or tile.video.stdout is None:
+            return
+        fd = tile.video.stdout.fileno()
+        while len(tile.buffer) < want:
+            try:
+                # Bounded so a big catch-up cannot allocate a huge chunk at once.
+                chunk = os.read(
+                    fd, min(want - len(tile.buffer), self.frame_size * 8)
+                )
+            except (BlockingIOError, InterruptedError, OSError):
+                return
+            if not chunk:
+                return
+            tile.buffer += chunk
+
+    # ----- Drawing -----
 
     def _composite(self) -> None:
-        if self._wall is None:
-            return
-        self._wall.fill((0, 0, 0))
-        stride_w = self._cell_w + self._border
-        stride_h = self._cell_h + self._border
-        for i, surf in enumerate(self._tile_surfaces):
-            if surf is None:
+        self.wall.fill((0, 0, 0))
+        stride_w = self.cfg.cell_w + self.cfg.border
+        stride_h = self.cfg.cell_h + self.cfg.border
+        for i, tile in enumerate(self.playback):
+            if tile.surface is None:
                 continue
-            col = i % self._cols
-            row = i // self._cols
-            self._wall.blit(surf, (col * stride_w, row * stride_h))
+            col = i % self.cfg.cols
+            row = i // self.cfg.cols
+            self.wall.blit(tile.surface, (col * stride_w, row * stride_h))
 
-    # ----- Keyboard -----
+    def _draw(self) -> None:
+        """Show the wall, letterboxed so a resized window cannot stretch it.
 
-    def _handle_key(self, key: int, mod: int):
+        A tiling compositor (e.g. niri) may resize the window to an aspect
+        ratio that no longer matches the grid, so scale to *fit* and centre.
+        """
+        win_w, win_h = self.screen.get_size()
+        if (win_w, win_h) == (self.wall_w, self.wall_h):
+            self.dst_rect = (0, 0, win_w, win_h)
+            self.screen.blit(self.wall, (0, 0))
+        else:
+            scale = min(win_w / self.wall_w, win_h / self.wall_h)
+            dst_w = max(1, int(self.wall_w * scale))
+            dst_h = max(1, int(self.wall_h * scale))
+            off_x = (win_w - dst_w) // 2
+            off_y = (win_h - dst_h) // 2
+            self.dst_rect = (off_x, off_y, dst_w, dst_h)
+            self.screen.fill((0, 0, 0))
+            self.screen.blit(
+                pygame.transform.scale(self.wall, (dst_w, dst_h)), (off_x, off_y)
+            )
+        pygame.display.flip()
+
+    # ----- Input -----
+
+    def _handle_events(self) -> None:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+                return
+            if event.type == pygame.KEYDOWN:
+                self._handle_key(event.key, event.mod)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                self._replace_tile_at(event.pos)
+
+    def _handle_key(self, key: int, mod: int) -> None:
         if key == pygame.K_q:
             self.running = False
-            return
-        if key == pygame.K_SPACE:
-            self._toggle_pause()
-            return
-        if key == pygame.K_r:
-            self._replace_tile(random.randrange(len(self._tiles)))
-            return
-        if key == pygame.K_RIGHT:
-            self._pending_seek = 30.0 if (mod & pygame.KMOD_SHIFT) else 10.0
-            return
-        if key == pygame.K_LEFT:
-            self._pending_seek = -30.0 if (mod & pygame.KMOD_SHIFT) else -10.0
-            return
-        idx = self._key_to_tile(key)
-        if idx is not None and idx < len(self._tiles):
-            if self._pending_seek is not None:
-                self._seek_tile(idx, self._pending_seek)
-                self._pending_seek = None
+        elif key == pygame.K_SPACE:
+            self._set_paused(not self.paused)
+        elif key == pygame.K_r:
+            self._replace_tile(random.randrange(len(self.cfg.tiles)))
+        elif key in (pygame.K_LEFT, pygame.K_RIGHT):
+            # Seek is applied to the next tile key pressed.
+            step = 30.0 if mod & pygame.KMOD_SHIFT else 10.0
+            self._pending_seek = step if key == pygame.K_RIGHT else -step
+        else:
+            index = tile_index_for_key(key)
+            if index is None or index >= len(self.cfg.tiles):
+                return
+            if self._pending_seek is None:
+                self._replace_tile(index)
             else:
-                self._replace_tile(idx)
+                self._seek_tile(index, self._pending_seek)
+                self._pending_seek = None
 
-    @staticmethod
-    def _key_to_tile(key: int) -> int | None:
-        if pygame.K_1 <= key <= pygame.K_9:
-            return key - pygame.K_1
-        if key == pygame.K_0:
-            return 9
-        if pygame.K_a <= key <= pygame.K_f:
-            return key - pygame.K_a + 10
-        return None
-
-    def _handle_mouse(self, pos: tuple[int, int]) -> None:
-        """Replace the tile under a window-space click (if any)."""
-        if self._dst_rect is None or self._cols <= 0 or self._rows <= 0:
+    def _replace_tile_at(self, position: tuple[int, int]) -> None:
+        """Replace the tile under a window-space click, if it hit the wall."""
+        if self.dst_rect is None:
             return
-        off_x, off_y, dst_w, dst_h = self._dst_rect
-        win_x, win_y = pos
+        off_x, off_y, dst_w, dst_h = self.dst_rect
+        win_x, win_y = position
         if not (off_x <= win_x < off_x + dst_w and off_y <= win_y < off_y + dst_h):
-            return  # click landed in the letterbox bars
-        # Invert the fit-and-centre transform from _blit_frame.
-        wall_x = (win_x - off_x) * self.width / dst_w
-        wall_y = (win_y - off_y) * self.height / dst_h
-        stride_w = self._cell_w + self._border
-        stride_h = self._cell_h + self._border
-        if stride_w <= 0 or stride_h <= 0:
-            return
+            return  # the click landed in the letterbox bars
+        # Invert the fit-and-centre transform from _draw.
+        wall_x = (win_x - off_x) * self.wall_w / dst_w
+        wall_y = (win_y - off_y) * self.wall_h / dst_h
+        stride_w = self.cfg.cell_w + self.cfg.border
+        stride_h = self.cfg.cell_h + self.cfg.border
         col = int(wall_x // stride_w)
         row = int(wall_y // stride_h)
-        if not (0 <= col < self._cols and 0 <= row < self._rows):
+        if not (0 <= col < self.cfg.cols and 0 <= row < self.cfg.rows):
             return
-        idx = row * self._cols + col
-        if idx >= len(self._tiles):
-            return
-        self._replace_tile(idx)
+        index = row * self.cfg.cols + col
+        if index < len(self.cfg.tiles):
+            self._replace_tile(index)
 
-    def _toggle_pause(self) -> None:
-        if not self.paused:
-            for i in range(len(self._vid_procs)):
-                signal_proc(self._vid_procs[i], signal.SIGSTOP)
-                signal_proc(self._aud_ffmpeg[i], signal.SIGSTOP)
-                signal_proc(self._aud_ffplay[i], signal.SIGSTOP)
-            self.paused = True
-        else:
-            for i in range(len(self._vid_procs)):
-                signal_proc(self._vid_procs[i], signal.SIGCONT)
-                signal_proc(self._aud_ffmpeg[i], signal.SIGCONT)
-                # Keep audio held if this tile's first frame is still pending.
-                if not self._audio_gated[i]:
-                    signal_proc(self._aud_ffplay[i], signal.SIGCONT)
-            self.paused = False
+    def _set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        sig = signal.SIGSTOP if paused else signal.SIGCONT
+        for tile in self.playback:
+            signal_proc(tile.video, sig)
+            signal_proc(tile.audio_ffmpeg, sig)
+            if not tile.audio_held:  # held audio must stay stopped
+                signal_proc(tile.audio_player, sig)
 
-    # ----- Pipeline lifecycle -----
+    # ----- Tile selection -----
 
     def _replace_tile(self, index: int, ban: Path | None = None) -> None:
-        if not (0 <= index < len(self._tiles)):
-            return
-
-        if ban:
-            self._banned.add(ban)
-
-        active_paths = {t.path for j, t in enumerate(self._tiles) if j != index}
-        current_path = self._tiles[index].path
-        pool = self._pool
-
-        def _pick(candidates: list[Path], label: str) -> Path | None:
-            if not candidates:
-                return None
-            shuffled = list(candidates)
-            random.shuffle(shuffled)
-            for p in shuffled:
-                if p in self._banned:
-                    continue
-                if is_valid_video(p):
-                    if self.verbose:
-                        print(f"[info] replace: {label}: {p.name}", file=sys.stderr)
-                    return p
-            return None
-
-        new_path = _pick(
-            [p for p in pool if p not in active_paths and p != current_path],
-            "unused+different",
+        if ban is not None:
+            self.banned.add(ban)
+        path = self._pick_replacement(index)
+        self.cfg.tiles[index] = TileState(
+            path, random_seek(path, self.cfg.loop, self.start_pct, self.end_pct)
         )
-        if new_path is None:
-            new_path = _pick([p for p in pool if p not in active_paths], "unused")
-        if new_path is None:
-            new_path = _pick([p for p in pool if p != current_path], "any different")
-        if new_path is None:
-            if self.verbose:
-                print("[info] replace: fallback to current", file=sys.stderr)
-            new_path = current_path
-
-        self._tiles[index] = TileState(
-            path=new_path,
-            seek=random_seek(new_path, self._loop, self._start_pct, self._end_pct),
-        )
-        # Only this tile restarts; the others keep playing untouched.
         self._start_tile(index)
+
+    def _pick_replacement(self, index: int) -> Path:
+        """Prefer an unused file, then any different one, then the same one."""
+        current = self.cfg.tiles[index].path
+        in_use = {t.path for i, t in enumerate(self.cfg.tiles) if i != index}
+        groups = (
+            [p for p in self.pool if p not in in_use and p != current],
+            [p for p in self.pool if p not in in_use],
+            [p for p in self.pool if p != current],
+        )
+        for group in groups:
+            random.shuffle(group)
+            for path in group:
+                if path not in self.banned and is_valid_video(path):
+                    if self.cfg.verbose:
+                        print(f"[info] replace: {path.name}", file=sys.stderr)
+                    return path
+        return current
 
     def _seek_tile(self, index: int, delta: float) -> None:
-        if not (0 <= index < len(self._tiles)):
-            return
-        t = self._tiles[index]
-        t.seek = normalize_seek(t.path, t.seek + delta, self._loop)
+        tile = self.cfg.tiles[index]
+        tile.seek = normalize_seek(tile.path, tile.seek + delta, self.cfg.loop)
         self._start_tile(index)
 
-    def run(
-        self,
-        tiles: list[TileState],
-        pool: list[Path],
-        start_pct: float,
-        end_pct: float,
-        loop: bool,
-        make_cfg,
-    ) -> None:
-        """Main loop: pump tile decoders, composite, handle pygame events."""
-        self._tiles = tiles
-        self._pool = pool
-        self._start_pct = start_pct
-        self._end_pct = end_pct
-        self._loop = loop
-        self._make_cfg = make_cfg
+    # ----- Main loop -----
+
+    def _due_frames(self) -> int:
+        """How many 1/VIDEO_FPS frames of content the wall clock owes."""
+        now = time.monotonic()
+        if self._last_tick is None:
+            self._last_tick = now
+            self._frames_due = 1.0
+        else:
+            self._frames_due += (now - self._last_tick) * VIDEO_FPS
+            self._last_tick = now
+        due = int(self._frames_due)
+        self._frames_due -= due
+        return min(due, MAX_CATCHUP_FRAMES)
+
+    def _recycle_dead_tiles(self) -> None:
+        """Replace a tile whose decoder exited (EOF, corrupt file, …)."""
+        for i, tile in enumerate(self.playback):
+            if tile.video is not None and tile.video.poll() is not None:
+                self._replace_tile(i, ban=self.cfg.tiles[i].path)
+                return
+
+    def run(self) -> None:
+        """Start every tile and loop until the user quits."""
+        print(f"Controls:\n{CONTROLS}\n", file=sys.stderr)
         self.running = True
-
-        self._start_all()
-
-        print(
-            "Controls:\n"
-            "  SPACE        = pause/resume\n"
-            "  r            = replace a random tile\n"
-            "  1-9, 0, a-f  = replace specific tile (1-9=1-9, 0=10, a-f=11-16)\n"
-            "  Left/Right   = seek -10s/+10s, then press a tile key\n"
-            "  Shift+arrows = seek -30s/+30s\n"
-            "  right-click  = replace the tile under the cursor\n"
-            "  q            = quit\n",
-            file=sys.stderr,
-        )
-
         try:
+            for i in range(len(self.playback)):
+                self._start_tile(i)
             while self.running:
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        self.running = False
-                        break
-                    if event.type == pygame.KEYDOWN:
-                        self._handle_key(event.key, event.mod)
-                    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-                        self._handle_mouse(event.pos)
-
+                self._handle_events()
                 if not self.running:
                     break
-
-                if not self.paused:
-                    # Recycle any tile whose decoder died (EOF, corrupt file…).
-                    for i, proc in enumerate(self._vid_procs):
-                        if proc is not None and proc.poll() is not None:
-                            self._replace_tile(i, ban=self._tiles[i].path)
-                            break
-
-                    # How many 1/30s frames of content should have advanced?
-                    now = time.monotonic()
-                    if self._last_tick is None:
-                        self._last_tick = now
-                        self._frames_due = 1.0
-                    else:
-                        self._frames_due += (now - self._last_tick) * VIDEO_FPS
-                        self._last_tick = now
-                    due = int(self._frames_due)
-                    self._frames_due -= due
-                    if due > MAX_CATCHUP_FRAMES:
-                        due = MAX_CATCHUP_FRAMES
-                        self._frames_due = 0.0
-
-                    self._pump_frames(due)
-                    self._composite()
-                    if self._wall is not None:
-                        self._blit_frame(self._wall)
-                        pygame.display.flip()
-                else:
+                if self.paused:
                     self._last_tick = None
-
+                else:
+                    self._recycle_dead_tiles()
+                    self._pump_frames(self._due_frames())
+                    self._composite()
+                    self._draw()
                 self._clock.tick(VIDEO_FPS)
         finally:
-            self._stop_procs()
+            for tile in self.playback:
+                self._stop_playback(tile)
             pygame.display.quit()
             pygame.quit()
 
-    def _blit_frame(self, surface: pygame.Surface) -> None:
-        """Show a frame, preserving aspect ratio with black bars.
 
-        A tiling compositor (e.g. niri) can resize the window to something
-        that no longer matches the grid, so scale to *fit* and centre instead
-        of stretching the wall to fill.
-        """
-        win_w, win_h = self.screen.get_size()
-        if (win_w, win_h) == (self.width, self.height):
-            self._dst_rect = (0, 0, win_w, win_h)
-            self.screen.blit(surface, (0, 0))
-            return
-
-        scale = min(win_w / self.width, win_h / self.height)
-        dst_w = max(1, int(self.width * scale))
-        dst_h = max(1, int(self.height * scale))
-        off_x = (win_w - dst_w) // 2
-        off_y = (win_h - dst_h) // 2
-        self._dst_rect = (off_x, off_y, dst_w, dst_h)
-        self.screen.fill((0, 0, 0))
-        self.screen.blit(
-            pygame.transform.scale(surface, (dst_w, dst_h)),
-            (off_x, off_y),
-        )
+# -------- CLI --------
 
 
-# -------- Main --------
-
-
-def main() -> None:
-    need("ffmpeg")
-    need("ffprobe")
-
+def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Single-window video wall with pygame viewer + audio.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Keyboard controls (pygame window):\n"
-            "  SPACE        = pause/resume\n"
-            "  r            = replace a random tile\n"
-            "  1-9, 0, a-f  = replace specific tile (1-9=1-9, 0=10, a-f=11-16)\n"
-            "  Left/Right   = seek -10s/+10s, then press a tile key\n"
-            "  Shift+arrows = seek -30s/+30s\n"
-            "  right-click  = replace the tile under the cursor\n"
-            "  q            = quit"
-        ),
+        epilog=f"Keyboard controls (pygame window):\n{CONTROLS}",
     )
     ap.add_argument("folder", type=Path, help="Folder with videos")
 
-    # Grid
-    ap.add_argument("--count", "-n", type=int, default=4, help="Number of tiles (1–16)")
-    ap.add_argument(
+    grid = ap.add_argument_group("grid")
+    grid.add_argument("--count", "-n", type=int, default=4, help="Number of tiles (1–16)")
+    grid.add_argument(
         "--grid", metavar="NxM",
         help="Grid layout (e.g. 3x3, 2x4). Auto-computed from --count if omitted.",
     )
-    ap.add_argument("--cell-width", type=int, default=480, help="Tile width in px")
-    ap.add_argument("--cell-height", type=int, default=270, help="Tile height in px")
-    ap.add_argument("--border", type=int, default=0, help="Black gap (px) between tiles")
+    grid.add_argument("--cell-width", type=int, default=480, help="Tile width in px")
+    grid.add_argument("--cell-height", type=int, default=270, help="Tile height in px")
+    grid.add_argument("--border", type=int, default=0, help="Black gap (px) between tiles")
 
-    # Playback
-    ap.add_argument("--loop", action="store_true", help="Loop each input")
-    ap.add_argument(
-        "--exts",
-        default=",".join(DEFAULT_EXTS),
+    playback = ap.add_argument_group("playback")
+    playback.add_argument("--loop", action="store_true", help="Loop each input")
+    playback.add_argument(
+        "--exts", default=",".join(DEFAULT_EXTS),
         help="Comma-separated extensions (default: %(default)s)",
     )
-    ap.add_argument(
-        "--recursive",
-        action="store_true",
+    playback.add_argument(
+        "--recursive", action="store_true",
         help="Recursively scan subdirectories for videos",
     )
-    ap.add_argument(
-        "--start-pct",
-        type=float, default=0.5, metavar="PCT",
+    playback.add_argument(
+        "--start-pct", type=float, default=0.5, metavar="PCT",
         help="Start of random seek window (0–1, default: 0.5)",
     )
-    ap.add_argument(
-        "--end-pct",
-        type=float, default=0.75, metavar="PCT",
+    playback.add_argument(
+        "--end-pct", type=float, default=0.75, metavar="PCT",
         help="End of random seek window (0–1, default: 0.75)",
     )
-    ap.add_argument("--seed", type=int, help="Random seed for deterministic runs")
-    ap.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg logs")
+    playback.add_argument("--seed", type=int, help="Random seed for deterministic runs")
+    playback.add_argument("--verbose", "-v", action="store_true", help="Show ffmpeg logs")
 
-    # Audio (enabled by default)
-    ap.add_argument(
-        "--no-audio", action="store_true",
-        help="Disable audio playback",
+    audio = ap.add_argument_group("audio")
+    audio.add_argument("--no-audio", action="store_true", help="Disable audio playback")
+    audio.add_argument(
+        "--volume", type=float, default=0.5, help="Per-input pre-mix gain (default: 0.5)"
     )
-    ap.add_argument(
-        "--volume", type=float, default=0.5,
-        help="Per-input pre-mix gain (default: 0.5)",
-    )
-    ap.add_argument(
-        "--audio-mode",
-        choices=["mix", "one"], default="mix",
+    audio.add_argument(
+        "--audio-mode", choices=["mix", "one"], default="mix",
         help="Mix all audio or use only one tile's audio",
     )
-    ap.add_argument(
-        "--audio-tile",
-        type=int, default=0, metavar="TILE",
+    audio.add_argument(
+        "--audio-tile", type=int, default=0, metavar="TILE",
         help="Tile index (0-based) for --audio-mode=one",
     )
-    ap.add_argument(
-        "--audio-rate",
-        type=int, default=48000, metavar="HZ",
+    audio.add_argument(
+        "--audio-rate", type=int, default=48000, metavar="HZ",
         help="Sample rate in Hz (default: 48000)",
     )
 
-    # Display
-    ap.add_argument(
-        "--fullscreen", "-f", action="store_true",
-        help="Fullscreen mode",
-    )
-
-    # HW
-    ap.add_argument(
-        "--hwaccel",
-        default="off",
-        choices=["auto", "off", "cuda", "vaapi"],
+    display = ap.add_argument_group("display")
+    display.add_argument("--fullscreen", "-f", action="store_true", help="Fullscreen mode")
+    display.add_argument(
+        "--hwaccel", default="off", choices=["auto", "off", "cuda", "vaapi"],
         help="HW decode: off (default), auto, cuda, or vaapi",
     )
+    return ap.parse_args()
 
-    args = ap.parse_args()
 
-    grid = parse_grid(args.grid)
+def main() -> None:
+    args = parse_args()
+    require_tools("ffmpeg", "ffprobe")
 
     if args.count < 1 or args.count > MAX_TILES:
         raise SystemExit(f"--count must be between 1 and {MAX_TILES}.")
+    grid = parse_grid(args.grid)
     if grid and grid[0] * grid[1] < args.count:
         raise SystemExit(
-            f"Grid {grid[0]}x{grid[1]} = {grid[0]*grid[1]} slots "
+            f"Grid {grid[0]}x{grid[1]} = {grid[0] * grid[1]} slots "
             f"is smaller than --count {args.count}."
         )
     if not args.folder.is_dir():
         raise SystemExit(f"{args.folder} is not a directory.")
-
-    exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
-
-    if args.recursive:
-        print(f"Scanning {args.folder} recursively...", file=sys.stderr, flush=True)
-        ext_set = set(exts)
-        pool = []
-        for dirpath, _, filenames in os.walk(args.folder):
-            for name in filenames:
-                if Path(name).suffix.lower() in ext_set:
-                    pool.append(Path(dirpath) / name)
-    else:
-        pool = [
-            p for p in args.folder.iterdir()
-            if p.is_file() and p.suffix.lower() in exts
-        ]
-
-    if len(pool) < args.count:
-        raise SystemExit(
-            f"Need at least {args.count} videos with extensions {exts}, "
-            f"found {len(pool)} in {args.folder}."
-        )
-
-    initial_paths = pick_videos(pool, args.count, exts, args.seed)
-    tiles: list[TileState] = [
-        TileState(
-            path=p,
-            seek=random_seek(p, args.loop, args.start_pct, args.end_pct),
-        )
-        for p in initial_paths
-    ]
-    rows, cols = compute_grid(args.count, grid)
-
-    hw_cfg = choose_hwaccel(args.hwaccel)
-    if args.verbose:
-        print(f"[info] HW accel: {hw_cfg.mode or 'software'}", file=sys.stderr)
-        if hw_cfg.mode == "vaapi" and "-vaapi_device" in hw_cfg.global_opts:
-            print(
-                f"  (device {hw_cfg.global_opts['-vaapi_device']})",
-                file=sys.stderr,
-            )
-        print(f"[info] Grid: {cols}×{rows} = {args.count} tiles", file=sys.stderr)
-
-    total_w = cols * (args.cell_width + args.border) - args.border
-    total_h = rows * (args.cell_height + args.border) - args.border
-
-    def make_cfg(cur_tiles: list[TileState]) -> PipelineConfig:
-        return PipelineConfig(
-            tiles=cur_tiles,
-            rows=rows,
-            cols=cols,
-            cell_w=args.cell_width,
-            cell_h=args.cell_height,
-            loop=args.loop,
-            volume=args.volume,
-            hwaccel=hw_cfg,
-            verbose=args.verbose,
-            no_audio=args.no_audio,
-            audio_mode=args.audio_mode,
-            audio_tile=args.audio_tile,
-            audio_rate=args.audio_rate,
-            border=args.border,
-            fullscreen=args.fullscreen,
-        )
-
     if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         raise SystemExit(
             "No display detected (DISPLAY/WAYLAND_DISPLAY not set).\n"
             "Run from a desktop session with a display server running."
         )
 
-    viewer = VideoWindow(
-        width=total_w,
-        height=total_h,
-        fullscreen=args.fullscreen,
-        verbose=args.verbose,
-    )
-
-    try:
-        viewer.run(
-            tiles=tiles,
-            pool=pool,
-            start_pct=args.start_pct,
-            end_pct=args.end_pct,
-            loop=args.loop,
-            make_cfg=make_cfg,
+    exts = tuple(s.strip().lower() for s in args.exts.split(",") if s.strip())
+    pool = scan_folder(args.folder, exts, args.recursive)
+    if len(pool) < args.count:
+        raise SystemExit(
+            f"Need at least {args.count} videos with extensions {exts}, "
+            f"found {len(pool)} in {args.folder}."
         )
+    tiles = [
+        TileState(path, random_seek(path, args.loop, args.start_pct, args.end_pct))
+        for path in pick_videos(pool, args.count, exts, args.seed)
+    ]
+
+    rows, cols = compute_grid(args.count, grid)
+    hwaccel = choose_hwaccel(args.hwaccel)
+    if args.verbose:
+        print(f"[info] HW accel: {hwaccel.mode or 'software'}", file=sys.stderr)
+        if hwaccel.vaapi_device:
+            print(f"  (device {hwaccel.vaapi_device})", file=sys.stderr)
+        print(f"[info] Grid: {cols}x{rows} = {args.count} tiles", file=sys.stderr)
+
+    cfg = PipelineConfig(
+        tiles=tiles,
+        rows=rows,
+        cols=cols,
+        cell_w=args.cell_width,
+        cell_h=args.cell_height,
+        loop=args.loop,
+        volume=args.volume,
+        hwaccel=hwaccel,
+        verbose=args.verbose,
+        no_audio=args.no_audio,
+        audio_mode=args.audio_mode,
+        audio_tile=args.audio_tile,
+        audio_rate=args.audio_rate,
+        border=args.border,
+        fullscreen=args.fullscreen,
+    )
+    try:
+        VideoWindow(cfg, pool, args.start_pct, args.end_pct).run()
     except pygame.error as exc:
         raise SystemExit(f"Cannot open display: {exc}")
 
