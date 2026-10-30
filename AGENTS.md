@@ -79,9 +79,13 @@ per tile: ffmpeg (audio)              ──wav pipe─────▶ ffplay -n
   (`_watch_audio_clock` → `_audio_started`). Without that hold, 4K/NFS audio seek latency
   makes video lead audio by ~0.5 s. `AUDIO_START_TIMEOUT` prevents a permanently black tile
   if audio fails.
-- Frame pacing: `run()` accumulates `elapsed * VIDEO_FPS` into `_frames_due` and pumps
-  that many frames per tile; content is locked to the wall clock (30 fps) and stalls are
-  absorbed by dropping older frames. Cap via `MAX_CATCHUP_FRAMES`.
+- Frame pacing: ffplay's audio clock is the master. `_pump_frames` shows the frame whose
+  position matches `_audio_pos` and drops the rest, so a stall (tile restart, VAAPI hiccup)
+  cannot leave the video permanently behind the audio — the old pure wall-clock pacing did
+  exactly that (the 1 MB pipe only buffers ~2.7 cell frames, so lost time was never
+  recovered). Tiles with no live audio (`_audio_clock` returns None: muted, no track, or
+  ffplay stopped reporting for `AUDIO_CLOCK_STALE`) fall back to wall-clock pacing via
+  `elapsed * VIDEO_FPS` → `_frames_due`, capped by `MAX_CATCHUP_FRAMES`.
 - Pipe sizing: a raw cell frame is far larger than the 64 KB pipe default, so
   `_start_tile` raises `F_SETPIPE_SZ`. Read a whole frame per pump, not one chunk.
 - Teardown: `kill_proc` uses SIGKILL — children are stateless and graceful waits made

@@ -39,6 +39,9 @@ MAX_CATCHUP_FRAMES = 60
 # Max time to wait for a tile's audio to start playing before showing its video
 # anyway (keeps a broken/muted tile from staying black forever).
 AUDIO_START_TIMEOUT = 3.0
+# How long ffplay's audio clock may stop advancing before we stop treating it as
+# the video master clock (audio ended, ffplay died, stream stalled).
+AUDIO_CLOCK_STALE = 1.0
 # ffplay status line, e.g. "  12.34 M-A:  0.000 fd=...". The first number is
 # the master (audio) clock in seconds; `nan` lines don't match.
 _AUDIO_POS_RE = re.compile(rb"^\s*([-\d.]+)\s+M-A:")
@@ -535,7 +538,9 @@ class VideoWindow:
         self._audio_gated: list[bool] = []  # per-tile: audio held for first frame
         self._audio_started: list[bool] = []  # per-tile: ffplay clock is running
         self._audio_pos: list[float | None] = []  # per-tile ffplay clock (s)
+        self._audio_pos_wall: list[float | None] = []  # when the clock was last seen
         self._audio_release_wall: list[float | None] = []
+        self._tile_pos: list[int] = []  # per-tile: frames consumed since (re)start
         self._vid_allowed: list[bool] = []  # per-tile: may present video
         self._rows = 0
         self._cols = 0
@@ -595,7 +600,9 @@ class VideoWindow:
         self._tile_surfaces[index] = None
         self._audio_started[index] = False
         self._audio_pos[index] = None
+        self._audio_pos_wall[index] = None
         self._audio_release_wall[index] = None
+        self._tile_pos[index] = 0
 
         aud_cmd = build_tile_audio_cmd(cfg, index)
         self._vid_allowed[index] = aud_cmd is None
@@ -658,6 +665,7 @@ class VideoWindow:
                 m = _AUDIO_POS_RE.match(line)
                 if m and self._aud_ffplay[index] is proc:
                     self._audio_pos[index] = float(m.group(1))
+                    self._audio_pos_wall[index] = time.monotonic()
                     self._audio_started[index] = True
 
     def _release_tile_audio(self, index: int) -> None:
@@ -670,6 +678,21 @@ class VideoWindow:
         released = self._audio_release_wall[index]
         return released is not None and time.monotonic() - released > AUDIO_START_TIMEOUT
 
+    def _audio_clock(self, index: int) -> float | None:
+        """Audio position (s) for use as the A/V master clock, or None.
+
+        Returns None when the tile has no audio, or when ffplay stopped
+        reporting (stream ended, process died), so the caller falls back to
+        wall-clock pacing for that tile.
+        """
+        pos = self._audio_pos[index]
+        seen = self._audio_pos_wall[index]
+        if pos is None or seen is None:
+            return None
+        if time.monotonic() - seen > AUDIO_CLOCK_STALE:
+            return None
+        return pos
+
     def _stop_tile_audio(self, index: int) -> None:
         kill_proc(self._aud_ffmpeg[index])
         kill_proc(self._aud_ffplay[index])
@@ -678,6 +701,7 @@ class VideoWindow:
         self._audio_gated[index] = False
         self._audio_started[index] = False
         self._audio_pos[index] = None
+        self._audio_pos_wall[index] = None
         self._audio_release_wall[index] = None
 
     def _stop_procs(self) -> None:
@@ -709,22 +733,28 @@ class VideoWindow:
         self._audio_gated = [False] * n
         self._audio_started = [False] * n
         self._audio_pos = [None] * n
+        self._audio_pos_wall = [None] * n
         self._audio_release_wall = [None] * n
+        self._tile_pos = [0] * n
         self._vid_allowed = [True] * n
         for i in range(n):
             self._start_tile(i)
 
     def _pump_frames(self, due: int) -> None:
-        """Advance every tile by ``due`` frames of content (newest wins).
+        """Advance every tile to the frame it should be showing *now*.
 
-        ``due`` comes from the wall clock (see ``run``), so content plays at
-        ``VIDEO_FPS`` even if the loop iterates faster or slower. When behind,
-        older frames are discarded so a tile snaps back to the present.
+        Pacing has two masters:
+
+        * A tile with live audio follows ffplay's audio clock. The frame whose
+          content position matches what is being heard is shown and the frames
+          in between are dropped. This is what keeps A/V in sync: a loop stall
+          or a tile restart can lose video frames, but it cannot make the video
+          drift behind the soundtrack, because the target is absolute.
+        * A tile without audio (muted, no audio track, or ffplay gone) falls
+          back to the wall clock (``due``, see ``run``), which advances content
+          at ``VIDEO_FPS`` even if the loop iterates faster or slower.
         """
-        if due <= 0:
-            return
         fs = self._tile_frame_size
-        want = fs * due
         for i, proc in enumerate(self._vid_procs):
             if proc is None or proc.stdout is None or proc.poll() is not None:
                 continue
@@ -754,9 +784,24 @@ class VideoWindow:
                     continue
                 self._vid_allowed[i] = True
 
+            clock = self._audio_clock(i)
+            if clock is not None:
+                target = int(clock * VIDEO_FPS)
+                if target < self._tile_pos[i]:
+                    # Audio is behind the frame already on screen (restart
+                    # after an audio timeout, or clock jitter): wait for it.
+                    continue
+                want = (target - self._tile_pos[i] + 1) * fs
+            else:
+                if due <= 0:
+                    continue
+                want = due * fs
+
             while len(buf) < want:
                 try:
-                    data = os.read(fd, want - len(buf))
+                    # Cap each read so a large catch-up can't allocate a huge
+                    # temporary buffer in one go.
+                    data = os.read(fd, min(want - len(buf), fs * 8))
                 except (BlockingIOError, InterruptedError, OSError):
                     break
                 if not data:
@@ -766,6 +811,7 @@ class VideoWindow:
             if len(buf) < fs:
                 continue
             avail = len(buf) // fs
+            self._tile_pos[i] += avail
             # Present the newest available frame, drop the rest (catch-up).
             frame = bytes(buf[(avail - 1) * fs: avail * fs])
             del buf[: avail * fs]

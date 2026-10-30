@@ -13,9 +13,10 @@ Single-window video wall that plays multiple videos in a grid, using a **pygame*
 - Audio options: `--no-audio`, `--audio-mode {mix,one}`, `--audio-tile`, `--audio-rate`.
   Each tile has its own `ffmpeg → ffplay` chain; the sound server mixes the streams
   (`--volume` applies per stream).
-- **A/V sync**: audio is held (SIGSTOP) until the first video frame is ready, then video
-  is paced by a monotonic clock with frame-drop catch-up — so audio no longer starts
-  seconds ahead of the slow-to-start grid.
+- **A/V sync**: audio is held (SIGSTOP) until the first video frame is ready, and from then
+  on each tile's video follows ffplay's audio clock, dropping frames to stay on it — so audio
+  never starts seconds ahead of the grid, and repeated tile changes can't make the video
+  drift further behind the soundtrack.
 - **Aspect-preserving display**: if the window/display aspect differs from the grid
   (e.g. a tiling compositor resizes the window), the wall is letterboxed with black bars
   instead of being stretched.
@@ -109,8 +110,14 @@ per tile: ffmpeg (audio only)         ──wav pipe──────▶ ffplay
   is ready, audio is released and the video is held until ffplay's clock actually starts.
   This absorbs the audio pipeline's seek/startup latency (large for 4K/NFS), so the video
   can't start first and stay ahead of the audio.
-- **Presentation**: the wall clock decides how many 1/30 s frames each tile should advance
-  per iteration; older frames are dropped so a tile stays current (never races, never freezes).
+- **Audio is the master clock**: after that, each tile shows the frame whose position matches
+  ffplay's audio clock, dropping frames to stay on it. Wall-clock pacing alone let a stall
+  (tile restart, VAAPI hiccup) permanently lose video time — the video drifted further behind
+  the audio with every tile change. Tiles without live audio (muted/no track/ffplay ended)
+  fall back to the wall clock.
+- **Presentation**: the wall clock decides how many 1/30 s frames an audio-less tile should
+  advance per iteration; older frames are dropped so a tile stays current (never races,
+  never freezes).
 - **Scaling**: the composited wall is scaled to *fit* the current window, centred with black
   bars, so a tiling compositor resizing the window cannot stretch the grid.
 
